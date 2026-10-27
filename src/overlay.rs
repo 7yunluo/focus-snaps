@@ -297,7 +297,69 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
                     x1: rect.0 + rect.2,
                     y1: rect.1 + rect.3,
                 });
-                if std::env::var("FOCUSSNAPS_TEST_ANNOTATE").is_ok() {
+                // 宣传图用：一套更完整的示例标注
+                if std::env::var("FOCUSSNAPS_TEST_ANNOTATE").as_deref() == Ok("promo") {
+                    let color = s.doc.borrow().color;
+                    let width = s.doc.borrow().width;
+                    let (x, y) = (rect.0, rect.1);
+                    let label = "这段要改";
+                    // 文字比其它标注大一号，宣传图里才看得清
+                    let text_width = 6.5;
+                    let size = s.measure_text(idx, label, crate::paint::text_px(text_width));
+                    let mut d = s.doc.borrow_mut();
+                    // 高亮一行
+                    d.commit(Stroke {
+                        tool: Tool::Highlighter,
+                        color: (1.0, 0.78, 0.2),
+                        width: 4.0,
+                        points: vec![(x + 82.0, y + 152.0), (x + 355.0, y + 152.0)],
+                        text: None,
+                        number: None,
+                        text_size: None,
+                    });
+                    // 框住一块区域
+                    d.commit(Stroke {
+                        tool: Tool::Rect,
+                        color,
+                        width,
+                        points: vec![(x + 106.0, y + 254.0), (x + 372.0, y + 351.0)],
+                        text: None,
+                        number: None,
+                        text_size: None,
+                    });
+                    // 箭头指向它
+                    d.commit(Stroke {
+                        tool: Tool::Arrow,
+                        color,
+                        width,
+                        points: vec![(x + 510.0, y + 350.0), (x + 384.0, y + 312.0)],
+                        text: None,
+                        number: None,
+                        text_size: None,
+                    });
+                    // 序号
+                    d.commit(Stroke {
+                        tool: Tool::Number,
+                        color,
+                        width,
+                        points: vec![(x + 524.0, y + 362.0)],
+                        text: None,
+                        number: Some(1),
+                        text_size: None,
+                    });
+                    // 文字说明
+                    d.commit(Stroke {
+                        tool: Tool::Text,
+                        color,
+                        width: text_width,
+                        points: vec![(x + 110.0, y + 380.0)],
+                        text: Some(label.into()),
+                        number: None,
+                        text_size: size,
+                    });
+                    d.text_sel = None;
+                    drop(d);
+                } else if std::env::var("FOCUSSNAPS_TEST_ANNOTATE").is_ok() {
                     let color = s.doc.borrow().color;
                     let width = s.doc.borrow().width;
                     s.doc.borrow_mut().commit(Stroke {

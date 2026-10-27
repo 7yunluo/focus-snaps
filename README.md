@@ -2,6 +2,8 @@
 
 Wayland（niri / wlroots 系）下的截图与标注工具：一次抓屏后在每个显示器上铺一层浮层，框选、标注、保存或复制。
 
+![FocusSnapS 使用效果](docs/promo/focus-snaps-promo.png)
+
 ## 功能
 
 - **多显示器**：每个显示器一个独立浮层，各自的分辨率、缩放与旋转互不干扰
