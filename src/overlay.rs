@@ -105,6 +105,8 @@ struct Session {
     pointer_queued: bool,
     /// 正在后台读像素的屏（别重复读）
     pixels_reading: Vec<usize>,
+    /// 收窗口之后的超时保险已经上过了
+    export_timeout_armed: bool,
 }
 
 /// 等画面就绪后再执行的完成动作
@@ -428,6 +430,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         pending_hover: None,
         pointer_queued: false,
         pixels_reading: Vec::new(),
+        export_timeout_armed: false,
     }));
 
     for (idx, monitor) in picks.iter().enumerate() {
@@ -1907,19 +1910,54 @@ impl Session {
         }
     }
 
+    /// 用户已经确认了（复制/保存），浮层先收起来
+    ///
+    /// 剩下的活——等后台把像素读回来、编码、喂剪贴板/写文件——都不需要窗口了。
+    /// 让用户对着一个已经没有用的浮层干等一秒，比什么都难受；收起来他立刻
+    /// 就看见自己的桌面，剪贴板/文件过一会儿到位。
+    fn hide_windows(&mut self) {
+        for w in &self.wins {
+            w.window.set_visible(false);
+        }
+        // 窗口收起来之后就没法用界面自救了：万一导出那条路卡死（wl-copy 不返回
+        // 之类），这里兜一下，别留一个「看不见但还活着」的进程攥着键盘
+        if !self.export_timeout_armed {
+            self.export_timeout_armed = true;
+            let app = self.app.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_secs(20), move || {
+                if app.windows().iter().any(|w| w.is_visible()) {
+                    return;
+                }
+                eprintln!("导出超时（20 秒没有结果），直接退出");
+                app.quit();
+            });
+        }
+    }
+
+    /// 导出没做成（比如取像素失败）就把浮层还回去，别留个看不见的窗口
+    fn show_windows(&self) {
+        for w in &self.wins {
+            if !w.window.is_visible() {
+                w.window.set_visible(true);
+            }
+        }
+    }
+
     /// 复制选区并退出
     fn do_copy(&mut self, idx: Option<usize>) {
         if self.exporting {
             return;
         }
         self.ensure_selection(idx);
-        // 像素还在后台读也没关系，先把请求挂住，读回来立刻接着做
+        self.hide_windows();
+        // 像素还在后台读也没关系，浮层已经收了，读回来接着做
         if !self.all_ready() || !self.pixels_ready() {
-            trace("画面/像素还没就绪，复制等一会儿");
+            trace("画面/像素还没就绪，复制等一会儿（浮层已收）");
             self.pending = Some(Export::Copy(idx));
             return;
         }
         let Some((rgba, w, h)) = self.report(self.render_rgba(), "复制失败") else {
+            self.show_windows();
             return;
         };
         self.exporting = true;
@@ -1964,13 +2002,15 @@ impl Session {
             return;
         }
         self.ensure_selection(idx);
+        self.hide_windows();
         if !self.all_ready() || !self.pixels_ready() {
-            trace("画面/像素还没就绪，保存等一会儿");
+            trace("画面/像素还没就绪，保存等一会儿（浮层已收）");
             self.pending = Some(Export::Save(idx));
             return;
         }
         let dir = self.doc.borrow().dir.clone();
         let Some((rgba, w, h)) = self.report(self.render_rgba(), "保存失败") else {
+            self.show_windows();
             return;
         };
         self.exporting = true;
