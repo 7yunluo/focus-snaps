@@ -537,71 +537,71 @@ fn place_palette(palette: &gtk::Box, root: &gtk::Box, area: (f64, f64)) {
     }
 }
 
-pub fn load_css() {
-    let provider = gtk::CssProvider::new();
-    provider.load_from_data(
-        "
+/// 重新加载样式表（强调色跟随系统主题色）
+/// 样式表；强调色占位符在加载时替换
+const CSS: &str = "
+        @define-color fs_accent ACCENT;
         .fs-bar {
-            background: rgba(24, 19, 16, 0.94);
+            background-color: rgba(24, 19, 16, 0.94);
             border-radius: 13px;
             padding: 5px;
-            border: 1px solid rgba(255, 182, 139, 0.28);
+            border: 1px solid alpha(@fs_accent, 0.28);
             box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
         }
         .fs-bar button {
             min-width: 26px;
             min-height: 22px;
             padding: 2px 7px;
-            background: transparent;
+            background-color: transparent;
             color: #eee2dc;
             border-radius: 7px;
             font-size: 12px;
             box-shadow: none;
             border: none;
         }
-        .fs-bar button:hover { background: rgba(255, 182, 139, 0.16); }
+        .fs-bar button:hover { background-color: alpha(@fs_accent, 0.16); }
         .fs-bar button:checked,
         .fs-bar button.fs-swatch-on {
-            background: rgba(255, 182, 139, 0.30);
-            color: #ffd9c0;
+            background-color: alpha(@fs_accent, 0.30);
+            color: lighter(@fs_accent);
         }
-        .fs-bar button.fs-swatch-on { box-shadow: inset 0 0 0 1.5px #ffb68b; }
-        .fs-bar button.fs-primary { color: #ffcaa8; }
+        .fs-bar button.fs-swatch-on { box-shadow: inset 0 0 0 1.5px @fs_accent; }
+        .fs-bar button.fs-primary { color: lighter(@fs_accent); }
         .fs-bar button.fs-tool { min-width: 22px; min-height: 22px; padding: 3px 4px; }
         .fs-bar button.fs-color { min-width: 22px; min-height: 22px; padding: 4px 6px; }
-        .fs-bar separator { background: rgba(255, 255, 255, 0.14); margin: 2px 3px; }
+        .fs-bar separator { background-color: rgba(255, 255, 255, 0.14); margin: 2px 3px; }
         .fs-bar spinbutton { min-height: 20px; }
         .fs-grip {
-            color: rgba(255, 217, 192, 0.55);
+            color: alpha(lighter(@fs_accent), 0.55);
             padding: 0 3px 0 1px;
             font-size: 13px;
         }
+        .fs-bar spinbutton text { background-color: transparent; color: #eee2dc; min-width: 22px; }
+        .fs-hint {
+            background-color: rgba(24, 19, 16, 0.82);
+            color: #eee2dc;
+            padding: 6px 14px;
+            border-radius: 10px;
+            font-size: 13px;
+        }
         .fs-palette {
-            background: rgba(24, 19, 16, 0.94);
+            background-color: rgba(24, 19, 16, 0.94);
             border-radius: 11px;
             padding: 7px;
-            border: 1px solid rgba(255, 182, 139, 0.28);
+            border: 1px solid alpha(@fs_accent, 0.28);
             box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
         }
         .fs-palette button {
             min-width: 19px;
             min-height: 19px;
             padding: 3px;
-            background: transparent;
+            background-color: transparent;
             border: none;
             border-radius: 50%;
             box-shadow: none;
         }
-        .fs-palette button:hover { background: rgba(255, 182, 139, 0.22); }
-        .fs-palette button.fs-swatch-on { box-shadow: inset 0 0 0 2px #ffb68b; }
-        .fs-bar spinbutton text { background: transparent; color: #eee2dc; min-width: 22px; }
-        .fs-hint {
-            background: rgba(24, 19, 16, 0.82);
-            color: #eee2dc;
-            padding: 6px 14px;
-            border-radius: 10px;
-            font-size: 13px;
-        }
+        .fs-palette button:hover { background-color: alpha(@fs_accent, 0.22); }
+        .fs-palette button.fs-swatch-on { box-shadow: inset 0 0 0 2px @fs_accent; }
         .fs-entry, .fs-entry:focus, .fs-entry:focus-within {
             background-color: transparent;
             background-image: none;
@@ -623,15 +623,29 @@ pub fn load_css() {
             min-width: 0;
             min-height: 0;
         }
-        ",
-    );
-    if let Some(display) = gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-    }
+";
+
+thread_local! {
+    static PROVIDER: std::cell::OnceCell<gtk::CssProvider> = const { std::cell::OnceCell::new() };
+}
+
+/// 按强调色重新加载样式表
+pub fn set_accent(accent: (f64, f64, f64)) {
+    let css = CSS.replace("ACCENT", &crate::theme::rgb_hex(accent));
+    PROVIDER.with(|cell| {
+        let provider = cell.get_or_init(|| {
+            let p = gtk::CssProvider::new();
+            if let Some(display) = gdk::Display::default() {
+                gtk::style_context_add_provider_for_display(
+                    &display,
+                    &p,
+                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                );
+            }
+            p
+        });
+        provider.load_from_data(&css);
+    });
 }
 
 /// 让输入框按标注的字体、字号、颜色就地显示文字

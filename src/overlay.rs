@@ -73,6 +73,8 @@ struct Session {
     text_at: Option<(usize, f64, f64)>,
     /// 上次重绘时选区所在的显示器
     last_out: Option<usize>,
+    /// 主题色监听，丢掉就收不到通知
+    theme_watch: Option<gio::Settings>,
     /// 当前持有键盘焦点的窗口
     focused: Option<usize>,
     /// 上���次单击（时间 + 位置），用于识别双击
@@ -141,7 +143,8 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
     if !gtk4_layer_shell::is_supported() {
         return Err("当前合成器不支持 wlr-layer-shell".into());
     }
-    crate::ui::load_css();
+    let accent = crate::theme::accent();
+    crate::ui::set_accent(accent);
 
     let display = gdk::Display::default().ok_or("拿不到 GDK display")?;
     let monitors = list_monitors(&display);
@@ -196,6 +199,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
     }
 
     let doc: Shared = Rc::new(RefCell::new(Doc::new(outs, crate::doc::default_dir())));
+    doc.borrow_mut().accent = accent;
     let sess: SessionRef = Rc::new(RefCell::new(Session {
         app: app.clone(),
         doc: doc.clone(),
@@ -203,6 +207,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         drag: DragState::default(),
         text_at: None,
         last_out: Some(usize::MAX),
+        theme_watch: None,
         focused: None,
         last_click: None,
     }));
@@ -210,6 +215,20 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
     for (idx, monitor) in picks.iter().enumerate() {
         let win = make_window(app, &sess, idx, monitor);
         sess.borrow_mut().wins.push(Rc::new(win));
+    }
+
+    // 系统强调色变了就跟着换（设置对象要留在 Session 里才收得到通知）
+    {
+        let sess2 = sess.clone();
+        let watch = crate::theme::watch(move |c| {
+            let s = sess2.borrow_mut();
+            s.doc.borrow_mut().accent = c;
+            crate::ui::set_accent(c);
+            for w in &s.wins {
+                w.area.queue_draw();
+            }
+        });
+        sess.borrow_mut().theme_watch = watch;
     }
 
     sess.borrow_mut().sync_ui();

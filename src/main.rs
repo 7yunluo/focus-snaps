@@ -7,6 +7,7 @@ mod overlay;
 mod paint;
 mod ui;
 mod niri;
+mod theme;
 mod windows;
 
 use std::io::Write;

@@ -29,6 +29,7 @@ pub fn paint(
         hover,
         text_sel,
         width,
+        accent,
         ..
     } = doc;
     let Some(out) = outs.get_mut(out_idx) else {
@@ -72,7 +73,7 @@ pub fn paint(
         // 还没框选时，把指针悬停的窗口勾出来
         if let Some((o, r)) = hover.as_ref() {
             if *o == out_idx {
-                draw_hover(cr, r);
+                draw_hover(cr, r, *accent);
             }
         }
         return;
@@ -93,17 +94,14 @@ pub fn paint(
         if !text.is_empty() {
             let layout = text_layout(cr, text, text_px(*width), true);
             let (tw, th) = layout.pixel_size();
-            draw_sel_frame(
-                cr,
-                (px, py, px + f64::from(tw), py + f64::from(th)),
-            );
+            draw_sel_frame(cr, (px, py, px + f64::from(tw), py + f64::from(th)), *accent);
         }
     }
     let _ = cr.restore();
 
-    draw_frame(cr, (x0, y0, x1, y1), *tool == Tool::Select);
+    draw_frame(cr, (x0, y0, x1, y1), *tool == Tool::Select, *accent);
     draw_badge(cr, out, (x0, y0, x1, y1));
-    draw_text_frame(cr, strokes, *text_sel);
+    draw_text_frame(cr, strokes, *text_sel, *accent);
 }
 
 fn quad(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64) {
@@ -113,9 +111,9 @@ fn quad(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64) {
 }
 
 /// 悬停窗口的高亮框
-fn draw_hover(cr: &cairo::Context, r: &crate::windows::Rect) {
+fn draw_hover(cr: &cairo::Context, r: &crate::windows::Rect, accent: (f64, f64, f64)) {
     let _ = cr.save();
-    cr.set_source_rgba(1.0, 0.72, 0.55, 0.95);
+    cr.set_source_rgba(accent.0, accent.1, accent.2, 0.95);
     cr.set_line_width(2.0);
     cr.rectangle(r.x0, r.y0, r.width(), r.height());
     let _ = cr.stroke();
@@ -123,20 +121,25 @@ fn draw_hover(cr: &cairo::Context, r: &crate::windows::Rect) {
 }
 
 /// 被选中 / 正在输入的文字外面的虚线框
-fn draw_text_frame(cr: &cairo::Context, strokes: &[Stroke], text_sel: Option<usize>) {
+fn draw_text_frame(
+    cr: &cairo::Context,
+    strokes: &[Stroke],
+    text_sel: Option<usize>,
+    accent: (f64, f64, f64),
+) {
     let Some(s) = text_sel.and_then(|i| strokes.get(i)) else {
         return;
     };
     let (Some((w, h)), Some(&(x, y))) = (s.text_size, s.points.first()) else {
         return;
     };
-    draw_sel_frame(cr, (x, y, x + w, y + h));
+    draw_sel_frame(cr, (x, y, x + w, y + h), accent);
 }
 
-fn draw_sel_frame(cr: &cairo::Context, r: (f64, f64, f64, f64)) {
+fn draw_sel_frame(cr: &cairo::Context, r: (f64, f64, f64, f64), accent: (f64, f64, f64)) {
     let (x0, y0, x1, y1) = r;
     let _ = cr.save();
-    cr.set_source_rgba(1.0, 0.72, 0.55, 0.9);
+    cr.set_source_rgba(accent.0, accent.1, accent.2, 0.9);
     cr.set_line_width(1.0);
     cr.set_dash(&[4.0, 3.0], 0.0);
     cr.rectangle(x0 - 3.0, y0 - 3.0, x1 - x0 + 6.0, y1 - y0 + 6.0);
@@ -145,7 +148,12 @@ fn draw_sel_frame(cr: &cairo::Context, r: (f64, f64, f64, f64)) {
 }
 
 /// 选区边框 + 拖拽手柄
-fn draw_frame(cr: &cairo::Context, r: (f64, f64, f64, f64), handles: bool) {
+fn draw_frame(
+    cr: &cairo::Context,
+    r: (f64, f64, f64, f64),
+    handles: bool,
+    accent: (f64, f64, f64),
+) {
     let (x0, y0, x1, y1) = r;
     let _ = cr.save();
     cr.set_line_width(1.0);
@@ -153,12 +161,12 @@ fn draw_frame(cr: &cairo::Context, r: (f64, f64, f64, f64), handles: bool) {
     cr.rectangle(x0 - 0.5, y0 - 0.5, x1 - x0 + 1.0, y1 - y0 + 1.0);
     let _ = cr.stroke();
 
-    cr.set_source_rgba(1.0, 0.72, 0.55, 1.0);
+    cr.set_source_rgba(accent.0, accent.1, accent.2, 1.0);
     cr.rectangle(x0 + 0.5, y0 + 0.5, x1 - x0 - 1.0, y1 - y0 - 1.0);
     let _ = cr.stroke();
 
     if handles {
-        cr.set_source_rgba(1.0, 0.72, 0.55, 1.0);
+        cr.set_source_rgba(accent.0, accent.1, accent.2, 1.0);
         for (hx, hy) in handle_points(r) {
             cr.rectangle(hx - HANDLE / 2.0, hy - HANDLE / 2.0, HANDLE, HANDLE);
         }

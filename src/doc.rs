@@ -176,6 +176,8 @@ pub struct Doc {
     pub hover: Option<(usize, Rect)>,
     /// 正在带框显示、可拖动的文字笔画下标
     pub text_sel: Option<usize>,
+    /// 界面强调色（跟随系统主题色）
+    pub accent: (f64, f64, f64),
 }
 
 impl Doc {
@@ -193,6 +195,7 @@ impl Doc {
             active: None,
             hover: None,
             text_sel: None,
+            accent: crate::theme::FALLBACK,
         }
     }
 
