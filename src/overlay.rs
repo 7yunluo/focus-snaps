@@ -1665,9 +1665,7 @@ impl Session {
                 continue;
             };
             // 洞：不加余量，边界和选区严丝合缝
-            let hole = paint::hole_rect(live, w.rect)
-                .filter(|_| std::env::var_os("FOCUSSNAPS_NO_HOLE").is_none())
-                .filter(|r| {
+            let hole = paint::hole_rect(live, w.rect).filter(|r| {
                 (r.2 - r.0).round() as i32 > 0 && (r.3 - r.1).round() as i32 > 0
             });
             match hole {
