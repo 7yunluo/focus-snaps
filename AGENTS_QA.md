@@ -54,3 +54,61 @@ FOCUSSNAPS_TEST_SELECT="900,100,200,100" FOCUSSNAPS_TEST_SAVE=/tmp/x.png ./targe
 
 `ydotool mousemove -a` 的绝对坐标要经过加速/映射换算，落点对不上；相对移动也会
 被指针加速带偏，跨屏拖动模拟很难复现。这类交互还是人工拖一次更快。
+
+## 抓 cairo 画布的像素，别留着多余的引用
+
+`ImageSurface::data()` 要求这个画布只有一份引用，否则报
+`Can't get exclusive access`，然后你会看到打码 / 导出一类功能静默失效。
+以前 `paint()` 为了贴图 `clone()` 了一份画面，正好把这个坑埋在那儿：
+打码那一步拿不到像素，块平均直接跳过了。
+
+## 浮层视觉回归怎么验（不靠肉眼）
+
+抓一张带浮层的图、一张不带的图，逐像素算比值：
+
+```sh
+./target/debug/FocusSnapS grab -o DP-3 --png /tmp/with.png     # 浮层开着
+./target/debug/FocusSnapS grab -o DP-3 --png /tmp/without.png  # 浮层关掉
+python3 -c "
+import numpy as np; from PIL import Image
+a=np.asarray(Image.open('/tmp/with.png').convert('L'),float)
+b=np.asarray(Image.open('/tmp/without.png').convert('L'),float)
+r=a/np.maximum(b,1)
+print('压暗区比值中位数', np.median(r[b>90]))"
+```
+
+压暗用的是 45% 黑，sRGB 混合，**比值应当是个常数 0.550**（不管是 cairo 画的还是
+CSS 矩形铺的）。比值对了就说明压暗几何没坏。别拿「被压暗的像素占比」当硬指标：
+桌面内容每次都在变，那个数会飘。
+
+跨运行的截图没法逐像素比对——状态栏时钟、聊天窗口都在动。
+
+## 想知道指针事件落在哪一层，用 Gtk.Widget.pick()
+
+不用折腾 ydotool。照真实层级在 python 里搭个小 repro，`win.pick(x, y, 0)`
+看返回哪个 widget 就行。`set_can_target(False)` 的层会被跳过，所以能确认
+「压暗层/标注层不吃事件、手势层接得到」。
+
+## 每帧成本怎么量（帧率是假的）
+
+帧率被 vsync 钉死（200 Hz 屏就是 5 ms 一帧），`FOCUSSNAPS_BENCH` 只能告诉你
+「追不追得上刷新率」。要量真实成本，跑两次不同帧数、取两次的 user+sys 相减：
+
+```sh
+TIMEFORMAT='%R'
+time FOCUSSNAPS_BENCH=100 FOCUSSNAPS_TEST_SELECT="100,300,600,400" ./target/release/FocusSnapS -o DP-1
+time FOCUSSNAPS_BENCH=400 FOCUSSNAPS_TEST_SELECT="100,300,600,400" ./target/release/FocusSnapS -o DP-1
+# (第二次 CPU 时间 - 第一次) / 300 = 每帧 CPU
+```
+
+重构前后的实测：DP-1（5120x2160）6.2 ms/帧 → 0.07 ms/帧，
+DP-3（1600x2560）2.4 ms/帧 → 0.33 ms/帧。
+
+## 对照版本用 git worktree 建，别在同一棵树里来回切
+
+```sh
+git worktree add /tmp/fs-old <旧提交>
+cd /tmp/fs-old && CARGO_TARGET_DIR=/tmp/fs-old-target cargo build --release
+```
+
+基准钩子（`FOCUSSNAPS_BENCH`）在两个树里都加上，跑同一组参数才可比。
