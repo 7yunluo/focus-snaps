@@ -21,6 +21,12 @@ pub struct Actions {
 /// 调色板每行的色块数
 const PALETTE_COLS: usize = 8;
 
+/// 调色板大致高度，只用来判断摆在工具条上方还是下方
+const PALETTE_EST_H: f64 = 96.0;
+
+/// 工具条大致高度，仅在还没完成分配时用
+const BAR_EST_H: f64 = 60.0;
+
 /// 调色板颜色
 const PALETTE: [((f64, f64, f64), &str); 24] = [
     ((1.0, 1.0, 1.0), "#ffffff"),
@@ -66,8 +72,6 @@ pub struct Ui {
     tool_buttons: Vec<gtk::ToggleButton>,
     /// 缓存的自然尺寸，避免每次拖动都重新 measure
     natural: Cell<Option<(f64, f64)>>,
-    /// 工具条高度，调色板靠它定位
-    bar_h: Rc<Cell<f64>>,
 }
 
 impl Ui {
@@ -87,8 +91,6 @@ impl Ui {
             let color = color.clone();
             dot.set_draw_func(move |_d, cr, w, h| draw_dot(cr, w, h, color.get()));
         }
-        // 工具条高度，place() 量到后写进来
-        let bar_h: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
         let palette = gtk::Box::new(gtk::Orientation::Vertical, 4);
         palette.add_css_class("fs-palette");
         palette.set_halign(gtk::Align::Start);
@@ -247,13 +249,11 @@ impl Ui {
         {
             let palette = palette.clone();
             let root = root.clone();
-            let bar_h = bar_h.clone();
             let area = area.clone();
             color_btn.connect_clicked(move |_| {
                 toggle_palette(
                     &palette,
                     &root,
-                    &bar_h,
                     (f64::from(area.width()), f64::from(area.height())),
                 )
             });
@@ -357,7 +357,6 @@ impl Ui {
             swatches,
             tool_buttons,
             natural: Cell::new(None),
-            bar_h,
         }
     }
 
@@ -383,9 +382,6 @@ impl Ui {
             }
             self.root.set_margin_start(nx.round() as i32);
             self.root.set_margin_top(ny.round() as i32);
-            if self.root.height() > 0 {
-                self.bar_h.set(f64::from(self.root.height()));
-            }
             return;
         }
         let (nat_w, nat_h) = match self.natural.get() {
@@ -423,9 +419,6 @@ impl Ui {
                 "PLACE sel={sel:?} area={area:?} nat={nat_w:.0}x{nat_h:.0} -> ({x:.0},{y:.0})"
             );
         }
-        if nat_h > 0.0 {
-            self.bar_h.set(nat_h);
-        }
         self.root.set_margin_start(x.round() as i32);
         self.root.set_margin_top(y.round() as i32);
     }
@@ -444,7 +437,7 @@ impl Ui {
     }
     /// 展开或收起调色板
     pub fn toggle_palette(&self, area: (f64, f64)) {
-        toggle_palette(&self.palette, &self.root, &self.bar_h, area);
+        toggle_palette(&self.palette, &self.root, area);
     }
 }
 
@@ -468,34 +461,40 @@ fn draw_dot(cr: &cairo::Context, w: i32, h: i32, c: (f64, f64, f64)) {
 }
 
 /// 在工具条下方展开或收起调色板
-fn toggle_palette(palette: &gtk::Box, root: &gtk::Box, bar_h: &Cell<f64>, area: (f64, f64)) {
+fn toggle_palette(palette: &gtk::Box, root: &gtk::Box, area: (f64, f64)) {
     if palette.is_visible() {
         palette.set_visible(false);
         return;
     }
+    place_palette(palette, root, area);
     palette.set_visible(true);
-    let (pw, ph) = (
-        f64::from(palette.measure(gtk::Orientation::Horizontal, -1).1),
-        f64::from(palette.measure(gtk::Orientation::Vertical, -1).1),
-    );
-    let bar_h = match bar_h.get() {
-        0.0 => f64::from(root.height()),
-        h => h,
-    };
-    let (aw, ah) = area;
+}
+
+/// 把调色板摆在工具条下方，下方放不下就贴到工具条上方
+fn place_palette(palette: &gtk::Box, root: &gtk::Box, area: (f64, f64)) {
+    // 位置只用工具条的位置和窗口尺寸算：调色板还没显示时量不到自己的高度，
+    // 上下两端交给 valign，让 GTK 自己按它的实际高度摆放
+    let ah = area.1;
     let top = f64::from(root.margin_top());
-    let x = f64::from(root.margin_start())
-        .min((aw - pw - 6.0).max(4.0))
-        .max(4.0);
-    let y = if top + bar_h + 6.0 + ph <= ah - 6.0 {
-        top + bar_h + 6.0
-    } else {
-        (top - ph - 6.0).max(4.0)
+    let bar_h = match root.height() {
+        0 => BAR_EST_H,
+        h => f64::from(h),
     };
-    palette.set_margin_start(x.round() as i32);
-    palette.set_margin_top(y.round() as i32);
+    let below = top + bar_h + 6.0;
+    // 下方够高就贴工具条下面，否则让 GTK 从窗口底部往上摆
+    let (valign, margin_top, margin_bottom) = if below + PALETTE_EST_H <= ah - 4.0 {
+        (gtk::Align::Start, below, 0.0)
+    } else {
+        (gtk::Align::End, 0.0, (ah - top + 6.0).max(0.0))
+    };
+    palette.set_valign(valign);
+    palette.set_margin_start(root.margin_start());
+    palette.set_margin_top(margin_top.round() as i32);
+    palette.set_margin_bottom(margin_bottom.round() as i32);
     if std::env::var("FOCUSSNAPS_TEST_POINTER").is_ok() {
-        eprintln!("PALETTE {pw:.0}x{ph:.0} bar_h={bar_h:.0} -> ({x:.0},{y:.0})");
+        eprintln!(
+            "PALETTE {valign:?} bar_h={bar_h:.0} top={margin_top:.0} bottom={margin_bottom:.0}"
+        );
     }
 }
 

@@ -116,7 +116,7 @@ FocusSnapS list                列出显示器模式、旋转、逻辑尺寸与�
 - `FOCUSSNAPS_TEST_ANNOTATE=1`：在选区里画几条示例标注
 - `FOCUSSNAPS_TEST_SAVE=路径`：渲染并落盘后退出
 - `FOCUSSNAPS_TEST_POINTER=1`：把指针的逻辑坐标、工具条摆放（`PLACE`）与拖动（`TOOLBAR`）、调色板位置（`PALETTE`）打到 stderr，供自动化脚本判定
-- `FOCUSSNAPS_TEST_PALETTE=1`：启动后展开调色板，配合 `grab` 截图检查外观
+- `FOCUSSNAPS_TEST_PALETTE=1`：启动后开关两次调色板，配合 `grab` 截图检查外观与摆放是否稳定
 
 `FocusSnapS detect -o DP-2 --png out.png` 会跑一遍窗口识别并把结果画在图上，窗口选得不准时用它排障。
 

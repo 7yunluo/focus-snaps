@@ -269,11 +269,20 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
             s.sync_ui();
             s.redraw();
             if std::env::var("FOCUSSNAPS_TEST_PALETTE").is_ok() {
-                // 自动化检查调色板外观
+                // 自动化检查调色板：连开两次，两次摆放位置应当一致
                 let out = s.doc.borrow().sel.map(|x| x.out);
-                if let Some(w) = out.and_then(|i| s.win_of(i)) {
-                    let area = (f64::from(w.area.width()), f64::from(w.area.height()));
-                    w.ui.toggle_palette(area);
+                if let Some(w) = out.and_then(|i| s.win_of(i)).cloned() {
+                    for delay in [300, 600, 750] {
+                        let w = w.clone();
+                        glib::timeout_add_local_once(
+                            std::time::Duration::from_millis(delay),
+                            move || {
+                                let area =
+                                    (f64::from(w.area.width()), f64::from(w.area.height()));
+                                w.ui.toggle_palette(area);
+                            },
+                        );
+                    }
                 }
             }
             if let Ok(path) = std::env::var("FOCUSSNAPS_TEST_SAVE") {

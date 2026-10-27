@@ -52,7 +52,7 @@ cargo install --path . --root ~/.local --force          # 本地安装到 ~/.loc
 
 ## 工具条 UI
 
-`ui.rs` 管工具条、调色板、文字输入框，三者都是 `GtkOverlay` 的独立子控件，位置靠 `set_margin_start/top` 摆；**不要换成 Popover**——浮层是 layer surface，弹窗表面在 layer shell 下不可靠。工具按钮画的是矢量图标（`icons.rs`，纯 cairo，不依赖图标主题）。调色板用 `Ui::bar_h`（`place()` 里量到的工具条高度）定位到工具条下方，别在展开时现取 `root.height()`/`measure()`——那一帧还没分配，量出来的值不可用。
+`ui.rs` 管工具条、调色板、文字输入框，三者都是 `GtkOverlay` 的独立子控件，位置靠 `set_margin_start/top` 摆；**不要换成 Popover**——浮层是 layer surface，弹窗表面在 layer shell 下不可靠。工具按钮画的是矢量图标（`icons.rs`，纯 cairo，不依赖图标主题）。调色板位置只用工具条的位置/高度加窗口尺寸算，上下方向交给 `valign` + `margin_top/margin_bottom` 让 GTK 自己按实际高度摆。**不要用 `measure()` 给 overlay 子控件定位置**：它返回的是「外边距 + 尺寸」，会把刚写进去的边距再读回来，位置就在两个值之间反复横跳。
 
 ## 窗口识别
 
