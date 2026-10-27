@@ -2346,6 +2346,13 @@ fn on_drag_update(s: &mut Session, _idx: usize, x: f64, y: f64) {
 }
 
 fn on_drag_end(s: &mut Session, idx: usize, x: f64, y: f64) {
+    // 「拖拽结束」和「左键抬起兜底」两个手势都会走到这儿，一次物理松手可能进来
+    // 两次。第二次进来时拖拽状态已经清掉了，要是还往下走，就会把这次松手当成
+    // 又点了一下——于是单击被凑成「双击」，直接就把截图确认掉了
+    if s.drag.kind == DragKind::None {
+        trace("松手：拖拽已经结束过了，忽略");
+        return;
+    }
     trace("松手");
     let kind = s.drag.kind;
     s.drag.kind = DragKind::None;
