@@ -35,9 +35,12 @@ pub fn paint(
         return;
     };
 
-    // 贴预先缩到逻辑尺寸的画面，避免每帧重采样
-    let _ = cr.set_source_surface(&out.shown, 0.0, 0.0);
+    // 画面按物理分辨率 1:1 贴到设备像素，避免二次采样发虚
+    let _ = cr.save();
+    cr.scale(1.0 / out.sx, 1.0 / out.sy);
+    let _ = cr.set_source_surface(&out.phys, 0.0, 0.0);
     let _ = cr.paint();
+    let _ = cr.restore();
 
     let sel = sel
         .filter(|s| s.out == out_idx)
@@ -581,4 +584,6 @@ mod tests {
         assert!(gray(&data, w, 200, 100) >= 195, "反向选区内部 {}", gray(&data, w, 200, 100));
     }
 }
+
+
 

@@ -188,9 +188,16 @@ fn solve_offset(
         return None;
     }
 
+    // 平铺窗口共用一个上下边界；输入法提示窗、消息通知这类浮窗会盖住上边，
+    // 拿 IPC 给的窗口高度当先验，只认间距对得上的那一对横向边
+    let want_h = cols
+        .iter()
+        .map(|c| c.3)
+        .fold(0.0_f64, f64::max)
+        * sy;
     let (top, bottom) = {
         let data = surface.data().ok()?;
-        horizontal_bounds(&data, stride, w, h, sy).unwrap_or((0.0, area.1))
+        horizontal_bounds(&data, stride, w, h, sy, want_h).unwrap_or((0.0, area.1))
     };
     let mut rects: Vec<Rect> = Vec::new();
     let mut x = t;
@@ -381,7 +388,7 @@ pub fn detect(
 
     // 圆角会让竖边在上下两端提前消失，这里用横向边把上下边界钉准。
     // 自己上下都有明显横向边缘的（浮动窗口）保留原范围，其余按平铺窗口的统一边界来。
-    if let Some((y0, y1)) = horizontal_bounds(&data, stride, w, h, sy) {
+    if let Some((y0, y1)) = horizontal_bounds(&data, stride, w, h, sy, 0.0) {
         let py0 = y0 * sy;
         let py1 = y1 * sy;
         for r in out.iter_mut() {
@@ -421,6 +428,7 @@ fn horizontal_bounds(
     w: usize,
     h: usize,
     sy: f64,
+    want: f64,
 ) -> Option<(f64, f64)> {
     let mut row = vec![0f32; h];
     for (y, slot) in row.iter_mut().enumerate().take(h - 1) {
@@ -447,7 +455,27 @@ fn horizontal_bounds(
     if peaks.len() < 2 {
         return None;
     }
-    // 取相距超过半屏、总强度最高的一对
+    // 先找间距与已知窗口高度相符的一对：这样浮窗挡住上边时也不会把上边认到浮窗下沿
+    if want > 8.0 {
+        let tol = (4.0 * sy).max(6.0);
+        let mut best: Option<(usize, usize, f32)> = None;
+        for i in 0..peaks.len() {
+            for j in i + 1..peaks.len() {
+                let d = (peaks[j].0 - peaks[i].0) as f64;
+                if (d - want).abs() > tol {
+                    continue;
+                }
+                let s = peaks[i].1 + peaks[j].1;
+                if best.map(|(_, _, bs)| s > bs).unwrap_or(true) {
+                    best = Some((peaks[i].0, peaks[j].0, s));
+                }
+            }
+        }
+        if let Some((a, b, _)) = best {
+            return Some(((a + 1) as f64 / sy, b as f64 / sy));
+        }
+    }
+    // 没有先验或对不上：取相距超过半屏、总强度最高的一对
     let mut best: Option<(usize, usize, f32)> = None;
     for i in 0..peaks.len() {
         for j in i + 1..peaks.len() {
@@ -570,6 +598,51 @@ mod tests {
             assert!((r.width() - *w as f64).abs() < 4.0, "{r:?}");
             want_x += *w as f64 + gap as f64;
         }
+    }
+
+    /// 造一张「窗口顶上压着输入法提示 / 通知浮窗」的画面
+    fn window_with_popup(w: i32, h: i32) -> cairo::ImageSurface {
+        let mut s = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).unwrap();
+        {
+            let stride = s.stride() as usize;
+            let mut d = s.data().unwrap();
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let i = y * stride + x * 4;
+                    let v: u8 = if (10..690).contains(&x) && (100..700).contains(&y) {
+                        180
+                    } else {
+                        30
+                    };
+                    // 浮窗：贴着窗口上边横过来，盖住上边大半
+                    let v = if (60..690).contains(&x) && (100..300).contains(&y) {
+                        60
+                    } else {
+                        v
+                    };
+                    d[i] = v;
+                    d[i + 1] = v;
+                    d[i + 2] = v;
+                    d[i + 3] = 255;
+                }
+            }
+        }
+        s.mark_dirty();
+        s
+    }
+
+    #[test]
+    fn horizontal_bounds_uses_ipc_height_when_popup_covers_top() {
+        let mut s = window_with_popup(700, 800);
+        let stride = s.stride() as usize;
+        let data = s.data().unwrap();
+        // 没有高度先验时，会把浮窗下沿当成窗口上边
+        let (top0, _) = horizontal_bounds(&data, stride, 700, 800, 1.0, 0.0).unwrap();
+        assert!((top0 - 300.0).abs() < 8.0, "无先验时 top={top0}");
+        // 给了 IPC 的窗口高度就认回真正的上边
+        let (top1, bottom1) = horizontal_bounds(&data, stride, 700, 800, 1.0, 600.0).unwrap();
+        assert!((top1 - 100.0).abs() < 8.0, "有先验时 top={top1}");
+        assert!((bottom1 - 700.0).abs() < 8.0, "有先验时 bottom={bottom1}");
     }
 
     #[test]

@@ -135,8 +135,6 @@ pub struct OutputLayer {
     pub sy: f64,
     /// 全分辨率画面，屏幕观感方向
     pub phys: cairo::ImageSurface,
-    /// 缩到逻辑尺寸的画面，浮层每帧直接贴这张
-    pub shown: cairo::ImageSurface,
     /// 这一屏上识别出来的窗口矩形（本屏逻辑坐标）
     pub windows: Vec<Rect>,
 }
@@ -149,36 +147,14 @@ impl OutputLayer {
         phys: cairo::ImageSurface,
         windows: Vec<Rect>,
     ) -> Self {
-        let shown = resample(&phys, size);
         Self {
             size,
             sx,
             sy,
             phys,
-            shown,
             windows,
         }
     }
-}
-
-/// 把画面缩到逻辑尺寸
-fn resample(phys: &cairo::ImageSurface, size: (f64, f64)) -> cairo::ImageSurface {
-    let w = (size.0.round() as i32).max(1);
-    let h = (size.1.round() as i32).max(1);
-    let out = match cairo::ImageSurface::create(cairo::Format::ARgb32, w, h) {
-        Ok(s) => s,
-        Err(_) => phys.clone(),
-    };
-    if let Ok(cr) = cairo::Context::new(&out) {
-        let _ = cr.scale(
-            f64::from(w) / f64::from(phys.width().max(1)),
-            f64::from(h) / f64::from(phys.height().max(1)),
-        );
-        let _ = cr.set_source_surface(phys, 0.0, 0.0);
-        let _ = cr.paint();
-    }
-    out.mark_dirty();
-    out
 }
 
 /// 默认标注颜色
