@@ -68,10 +68,11 @@ pub fn dmabuf_texture(buf: &crate::dmabuf::Buffer) -> Result<gdk::Texture, Strin
     built.map_err(|e| format!("显存缓冲导成纹理失败: {e}"))
 }
 
-/// 从纹理把像素要回来（GPU 侧的一次拷贝，比直接读显存快得多）
+/// 从纹理把像素要回来（GPU 侧的一次拷贝，DP-1 上 40 ms）
 ///
-/// 导出、打码、窗口识别需要 CPU 像素时才做；显存映射通常是 write-combined，
-/// 读起来慢一个数量级。
+/// 只在「用户已经要结果了」的时候用：平时像素由后台线程从显存里慢慢读
+/// （write-combined 映射，接近 1 秒），完全不占主线程；但按了复制/保存就是在
+/// 等结果，这时候换一次几十毫秒的停顿划算得多。
 pub fn pixels_from_texture(texture: &gdk::Texture) -> Result<(Vec<u8>, i32, i32), String> {
     let mut downloader = gdk::TextureDownloader::new(texture);
     downloader.set_format(gdk::MemoryFormat::B8g8r8a8Premultiplied);
