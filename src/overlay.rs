@@ -11,6 +11,7 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use crate::capture;
 use crate::doc::{intersect, union, Doc, OutputLayer, Rect4, Selection, Stroke, Tool};
 use crate::export;
+use crate::hole::Hole;
 use crate::paint::{self, HANDLE_HIT};
 use crate::ui::{Actions, Shared, Ui};
 
@@ -62,6 +63,8 @@ struct Win {
     window: gtk::ApplicationWindow,
     /// 本屏画面，铺满整屏；手势和光标都挂在它上面
     screen: gtk::Picture,
+    /// 亮洞：选区里那块没压暗的画面（纹理节点，CPU 不碰）
+    hole: Hole,
     /// 标注层，尺寸跟着选区走，通常只有屏幕的一小块
     annot: gtk::DrawingArea,
     /// 标注层左上角的全局逻辑坐标
@@ -114,7 +117,7 @@ type SessionRef = Rc<RefCell<Session>>;
 /// 启动阶段打点：设了 FOCUSSNAPS_TRACE 就往 stderr 打时间戳
 ///
 /// 热键到浮层出现之间到底慢在哪，用这个能一眼看出来（进程启动之后的阶段）。
-fn trace(msg: &str) {
+pub(crate) fn trace(msg: &str) {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let t = START.get_or_init(std::time::Instant::now);
     if std::env::var_os("FOCUSSNAPS_TRACE").is_some() {
@@ -748,6 +751,8 @@ fn apply_capture(
     }
     if let Some(w) = s.win_of(idx).cloned() {
         w.screen.set_paintable(Some(&texture));
+        // 亮洞贴的是同一张纹理，两边必须是同一个东西才对得上
+        w.hole.set_texture(Some(&texture));
         // 画面有了就不用再让窗口透明
         w.window.remove_css_class("fs-pending");
     }
@@ -944,10 +949,20 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
     dim.add_css_class("fs-dim");
     dim.set_can_target(false);
 
+    // 亮洞在压暗层上面、标注层下面：它盖住压暗，标注再盖住它
+    let hole = Hole::new();
+    hole.set_can_target(false);
+    hole.set_halign(gtk::Align::Start);
+    hole.set_valign(gtk::Align::Start);
+    hole.set_visible(false);
+
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&picture));
     overlay.add_overlay(&dim);
     overlay.set_measure_overlay(&dim, false);
+    overlay.add_overlay(&hole);
+    overlay.set_measure_overlay(&hole, false);
+    overlay.set_clip_overlay(&hole, true);
     overlay.add_overlay(&annot);
     overlay.set_measure_overlay(&annot, false);
     overlay.set_clip_overlay(&annot, true);
@@ -1245,6 +1260,7 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
         idx,
         window,
         screen: picture.clone(),
+        hole,
         annot,
         view,
         ui,
@@ -1276,12 +1292,51 @@ impl Session {
             }
         };
         for w in &self.wins {
+            // 整屏画面在窗口里铺满，洞要按这个尺寸把纹理摊开才对得上
+            let (pw, ph) = (f64::from(w.screen.width()), f64::from(w.screen.height()));
+            let area = if pw > 0.0 && ph > 0.0 {
+                (pw, ph)
+            } else {
+                (w.rect.2 - w.rect.0, w.rect.3 - w.rect.1)
+            };
             let Some((x0, y0, x1, y1)) = paint::annot_rect(live, w.rect) else {
                 if w.annot.is_visible() {
                     w.annot.set_visible(false);
                 }
+                if w.hole.is_visible() {
+                    w.hole.set_visible(false);
+                }
                 continue;
             };
+            // 洞：不加余量，边界和选区严丝合缝
+            let hole = paint::hole_rect(live, w.rect).filter(|r| {
+                (r.2 - r.0).round() as i32 > 0 && (r.3 - r.1).round() as i32 > 0
+            });
+            match hole {
+                Some((hx0, hy0, hx1, hy1)) => {
+                    let (hx, hy) = (hx0.round() as i32, hy0.round() as i32);
+                    let (hw, hh) = ((hx1 - hx0).round() as i32, (hy1 - hy0).round() as i32);
+                    if w.hole.margin_start() != hx {
+                        w.hole.set_margin_start(hx);
+                    }
+                    if w.hole.margin_top() != hy {
+                        w.hole.set_margin_top(hy);
+                    }
+                    if w.hole.width_request() != hw || w.hole.height_request() != hh {
+                        w.hole.set_size_request(hw, hh);
+                    }
+                    // 洞只知道自己贴在屏幕的哪一点，整屏画面按这个位置往左上摊开
+                    w.hole.place((f64::from(hx), f64::from(hy)), area);
+                    if !w.hole.is_visible() {
+                        w.hole.set_visible(true);
+                    }
+                }
+                None => {
+                    if w.hole.is_visible() {
+                        w.hole.set_visible(false);
+                    }
+                }
+            }
             let (x, y) = (x0.round() as i32, y0.round() as i32);
             let (bw, bh) = ((x1 - x0).round() as i32, (y1 - y0).round() as i32);
             if bw <= 0 || bh <= 0 {

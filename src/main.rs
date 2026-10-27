@@ -3,6 +3,7 @@ mod capture;
 mod dmabuf;
 mod doc;
 mod export;
+mod hole;
 mod icons;
 mod overlay;
 mod paint;

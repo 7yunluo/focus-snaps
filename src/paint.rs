@@ -38,9 +38,29 @@ pub fn annot_rect(live: Option<Rect4>, out_rect: Rect4) -> Option<Rect4> {
     }
 }
 
+/// 亮洞的范围（本屏局部坐标）
+///
+/// 跟标注层不一样，这里**不加余量**：洞的外面就是压暗，边界得和选区严丝合缝。
+/// 返回 None 表示这屏上没有洞，那块控件可以藏起来（洞藏在压暗层后面就等于没洞）。
+pub fn hole_rect(live: Option<Rect4>, out_rect: Rect4) -> Option<Rect4> {
+    let r = intersect(live?, out_rect)?;
+    let local = (
+        r.0 - out_rect.0,
+        r.1 - out_rect.1,
+        r.2 - out_rect.0,
+        r.3 - out_rect.1,
+    );
+    if local.2 > local.0 && local.3 > local.1 {
+        Some(local)
+    } else {
+        None
+    }
+}
+
 /// 画一个显示器上随交互变化的那一层：悬停框、标注、选区边框
 ///
-/// 屏幕画面在下层由 GtkPicture 合成、压暗在上层由 CSS 矩形铺，这里都不管。
+/// 屏幕画面在下层由 GtkPicture 合成、压暗由 CSS 矩形铺、亮洞由 hole 控件贴纹理，
+/// 这里都不管。
 ///
 /// 选区、标注都存在全局逻辑坐标里。`view` 是这张画布左上角的全局坐标：
 /// 画布只覆盖会画出东西的那块地方（选区加上一点余量），不用铺满整屏。
@@ -75,27 +95,6 @@ pub fn paint(
     // 之后统一按全局逻辑坐标画，只是把原点挪到画布左上角
     let _ = cr.save();
     cr.translate(-view.0, -view.1);
-
-    // 亮洞：把本屏画面按物理分辨率 1:1 贴进选区（还没框选时贴悬停的窗口）。
-    // 压暗是底下固定的一整块，所以外面那份画面是暗的，只有这一块是原亮度。
-    let bright = sel.or(hover.filter(|h| intersect(*h, out_rect).is_some()));
-    if let Some((bx0, by0, bx1, by1)) = bright.and_then(|r| intersect(r, out_rect)) {
-        if let Some(phys) = outs.get_mut(out_idx).and_then(|o| o.ensure_phys()) {
-            let _ = cr.save();
-            cr.rectangle(bx0, by0, bx1 - bx0, by1 - by0);
-            cr.clip();
-            // 画布的坐标系是「全局」，而画面是按「本屏局部」贴的：
-            // 要把本屏的左上角挪到它在全局里的位置，所以是 +origin
-            cr.translate(origin.0, origin.1);
-            cr.scale(1.0 / sx, 1.0 / sy);
-            // 1:1 贴的，别让 cairo 去插值
-            let pat = cairo::SurfacePattern::create(&*phys);
-            pat.set_filter(cairo::Filter::Nearest);
-            let _ = cr.set_source(&pat);
-            let _ = cr.paint();
-            let _ = cr.restore();
-        }
-    }
 
     let Some((x0, y0, x1, y1)) = sel else {
         // 还没框选时，把指针悬停的窗口勾出来
@@ -622,6 +621,25 @@ mod tests {
 
     fn gray(data: &[u8], w: usize, x: usize, y: usize) -> u8 {
         data[(y * w + x) * 4 + 1]
+    }
+
+    #[test]
+    fn hole_rect_is_exact_and_clamped() {
+        let out_rect = (0.0, 0.0, 1000.0, 800.0);
+        // 选区原样，不加余量（外面就是压暗，边界必须严丝合缝）
+        assert_eq!(
+            hole_rect(Some((100.0, 100.0, 300.0, 200.0)), out_rect),
+            Some((100.0, 100.0, 300.0, 200.0))
+        );
+        // 跨屏选区只取本屏那一段
+        assert_eq!(
+            hole_rect(Some((900.0, 100.0, 1400.0, 200.0)), out_rect),
+            Some((900.0, 100.0, 1000.0, 200.0))
+        );
+        // 选区完全在别的屏上
+        assert_eq!(hole_rect(Some((2000.0, 0.0, 2100.0, 100.0)), out_rect), None);
+        // 没有选区也没有悬停窗口
+        assert_eq!(hole_rect(None, out_rect), None);
     }
 
     #[test]
