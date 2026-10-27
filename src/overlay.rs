@@ -96,6 +96,17 @@ struct Session {
 
 type SessionRef = Rc<RefCell<Session>>;
 
+/// 启动阶段打点：设了 FOCUSSNAPS_TRACE 就往 stderr 打时间戳
+///
+/// 热键到浮层出现之间到底慢在哪，用这个能一眼看出来（进程启动之后的阶段）。
+fn trace(msg: &str) {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let t = START.get_or_init(std::time::Instant::now);
+    if std::env::var_os("FOCUSSNAPS_TRACE").is_some() {
+        eprintln!("[trace] +{:>4} ms  {msg}", t.elapsed().as_millis());
+    }
+}
+
 /// 单实例锁，避免同时开两个浮层
 fn acquire_lock() -> bool {
     use std::os::fd::AsFd;
@@ -182,6 +193,7 @@ pub fn run(opts: Options) -> i32 {
 
 /// 建好所有显示器的浮层并显示
 fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
+    trace("build 开始");
     // 这里已在 gtk::init 之后，可以设默认图标
     gtk::Window::set_default_icon_name("focus-snaps");
     if !gtk4_layer_shell::is_supported() {
@@ -197,6 +209,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
     }
 
     let metas = capture::probe().unwrap_or_default();
+    trace("probe 完");
     let mut outs = Vec::new();
     let mut textures: Vec<gdk::Texture> = Vec::new();
     let mut picks: Vec<gdk::Monitor> = Vec::new();
@@ -255,7 +268,9 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
                 continue;
             }
         };
+        trace(&format!("{connector} 抓屏完（{}x{}）", cap.width, cap.height));
         let mut phys = export::surface_from_rgba(cap.width, cap.height, &cap.pixels)?;
+        trace(&format!("{connector} 画布就绪"));
         // 像素直接交给纹理，省掉一次整屏拷贝
         let texture = export::texture_from_rgba_owned(
             std::mem::take(&mut cap.pixels),
@@ -271,6 +286,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         // GDK 给的显示器位置就是合成器的全局逻辑布局坐标，跨屏拼接全靠它
         let origin = (f64::from(geo.x()), f64::from(geo.y()));
         let mut win_rects = crate::windows::detect_for_output(&connector, &mut phys, sx, sy, size);
+        trace(&format!("{connector} 窗口识别完（{} 块）", win_rects.len()));
         // 窗口矩形跟着换成全局坐标，交互就只用一套坐标系
         for r in win_rects.iter_mut() {
             r.x0 += origin.0;
@@ -333,8 +349,29 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
     for w in sess.borrow().wins.clone() {
         w.ui.sync_color(color);
     }
+    trace("窗口都建好");
     for w in sess.borrow().wins.clone() {
         w.window.present();
+    }
+    trace("present 完");
+    {
+        let ticks = std::cell::Cell::new(0u32);
+        if let Some(w) = sess.borrow().wins.first() {
+            let w2 = w.clone();
+            w.annot.add_tick_callback(move |_w, _c| {
+                let n = ticks.get() + 1;
+                ticks.set(n);
+                if n <= 2 {
+                    trace(&format!("第 {n} 个帧时钟 tick"));
+                }
+                if n >= 2 {
+                    // 只用来打点，之后把窗口交还给正常流程
+                    let _ = &w2;
+                    return glib::ControlFlow::Break;
+                }
+                glib::ControlFlow::Continue
+            });
+        }
     }
 
     // 性能回归用：连续重绘若干帧，打印实际帧间隔（FOCUSSNAPS_BENCH=帧数）
@@ -658,7 +695,12 @@ fn make_window(
         let sess = sess.clone();
         let entry = ui.entry.clone();
         let view = view.clone();
+        let drawn = std::cell::Cell::new(false);
         annot.set_draw_func(move |_a, cr, _w, _h| {
+            if !drawn.get() {
+                drawn.set(true);
+                trace("首帧光栅化");
+            }
             let Ok(s) = sess.try_borrow() else { return };
             let Ok(mut doc) = s.doc.try_borrow_mut() else {
                 return;
