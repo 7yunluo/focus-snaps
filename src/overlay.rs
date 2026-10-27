@@ -246,12 +246,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         .map(|(connector, _, _)| {
             let name = connector.clone();
             std::thread::spawn(move || {
-                let cap = capture::capture_output(&name, cursor).map(|mut c| {
-                    // 换通道是整屏扫一遍的活，跟抓屏一起在后台做掉
-                    export::swizzle_rgba(&mut c.pixels);
-                    c
-                });
-                (name, cap)
+                (name.clone(), capture::capture_output(&name, cursor))
             })
         })
         .collect();
@@ -269,10 +264,10 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
             }
         };
         trace(&format!("{connector} 抓屏完（{}x{}）", cap.width, cap.height));
-        let mut phys = export::surface_from_rgba(cap.width, cap.height, &cap.pixels)?;
+        let mut phys = export::surface_from_bgra(cap.width, cap.height, &cap.pixels)?;
         trace(&format!("{connector} 画布就绪"));
-        // 像素直接交给纹理，省掉一次整屏拷贝
-        let texture = export::texture_from_rgba_owned(
+        // 抓屏缓冲直接交给纹理：GDK 认 BGRA，不用再整屏换一遍通道
+        let texture = export::texture_from_bgra_owned(
             std::mem::take(&mut cap.pixels),
             cap.width as i32,
             cap.height as i32,

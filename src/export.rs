@@ -36,13 +36,21 @@ pub fn surface_from_bgra(width: u32, height: u32, pixels: &[u8]) -> Result<cairo
     Ok(surface)
 }
 
-/// 把抓屏的 BGRA 像素就地换成 RGBA
+/// 抓屏的 BGRA 像素直接当纹理用，接管所有权
 ///
-/// 整屏扫一遍的事，跟抓屏一起放后台线程做，别占主线程。
-pub fn swizzle_rgba(pixels: &mut [u8]) {
-    for px in pixels.chunks_exact_mut(4) {
-        px.swap(0, 2);
-    }
+/// GDK 的显存格式本来就认 BGRA（cairo 画布也是这个顺序），不用再整屏换通道：
+/// 5120x2160 上能省掉一次 44 MB 的搬运。抓屏出来的 alpha 都是 255，
+/// 按预乘处理与直通一致。
+pub fn texture_from_bgra_owned(pixels: Vec<u8>, w: i32, h: i32) -> gdk::Texture {
+    let bytes = glib::Bytes::from_owned(pixels);
+    gdk::MemoryTexture::new(
+        w,
+        h,
+        gdk::MemoryFormat::B8g8r8a8Premultiplied,
+        &bytes,
+        (w as usize) * 4,
+    )
+    .upcast()
 }
 
 /// 渲染选区：跨屏时把各屏画面在物理像素上拼成一张整图
@@ -160,35 +168,6 @@ pub fn texture_from_rgba_owned(rgba: Vec<u8>, w: i32, h: i32) -> gdk::Texture {
         (w as usize) * 4,
     )
     .upcast()
-}
-
-/// 把 RGBA 像素包成画布
-///
-/// cairo 的 ARGB32 在内存里是 BGRX，拷进去的时候顺手换个通道。
-pub fn surface_from_rgba(
-    width: u32,
-    height: u32,
-    pixels: &[u8],
-) -> Result<cairo::ImageSurface, String> {
-    let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width as i32, height as i32)
-        .map_err(|e| format!("创建画布失败: {e}"))?;
-    {
-        let stride = surface.stride() as usize;
-        let row = width as usize * 4;
-        let mut data = surface.data().map_err(|e| format!("锁定画布失败: {e}"))?;
-        for y in 0..height as usize {
-            let src = &pixels[y * row..y * row + row];
-            let dst = &mut data[y * stride..y * stride + row];
-            for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
-                d[0] = s[2];
-                d[1] = s[1];
-                d[2] = s[0];
-                d[3] = s[3];
-            }
-        }
-    }
-    surface.mark_dirty();
-    Ok(surface)
 }
 
 fn stamp() -> String {
