@@ -66,8 +66,6 @@ struct Win {
     annot: gtk::DrawingArea,
     /// 标注层左上角的全局逻辑坐标
     view: Rc<std::cell::Cell<(f64, f64)>>,
-    /// 压暗的矩形，洞以外切成上/下/左/右四块，由 CSS 上色
-    dim: [gtk::Box; 4],
     ui: Ui,
     /// 本屏在全局布局里的左上角
     origin: (f64, f64),
@@ -315,7 +313,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
     }
 
     sess.borrow_mut().sync_ui();
-    sess.borrow().sync_dim();
+
     sess.borrow().sync_annot();
     let color = sess.borrow().doc.borrow().color;
     for w in sess.borrow().wins.clone() {
@@ -903,23 +901,16 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
     annot.set_visible(false);
     let view: Rc<std::cell::Cell<(f64, f64)>> = Rc::new(std::cell::Cell::new(origin));
 
-    // 压暗交给 4 块 CSS 实心矩形：合成器直接填色块，不占 CPU
-    let dim = std::array::from_fn(|_| gtk::Box::new(gtk::Orientation::Vertical, 0));
-    for d in dim.iter() {
-        d.add_css_class("fs-dim");
-        d.set_can_target(false);
-        d.set_halign(gtk::Align::Start);
-        d.set_valign(gtk::Align::Start);
-        d.set_visible(false);
-    }
+    // 压暗是一整块固定的 CSS 实心矩形：位置尺寸都不变，拖拽时不用重画它，
+    // 合成器也就不必每帧搬整屏
+    let dim = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    dim.add_css_class("fs-dim");
+    dim.set_can_target(false);
 
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&picture));
-    for d in dim.iter() {
-        overlay.add_overlay(d);
-        overlay.set_measure_overlay(d, false);
-        overlay.set_clip_overlay(d, true);
-    }
+    overlay.add_overlay(&dim);
+    overlay.set_measure_overlay(&dim, false);
     overlay.add_overlay(&annot);
     overlay.set_measure_overlay(&annot, false);
     overlay.set_clip_overlay(&annot, true);
@@ -1203,7 +1194,6 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
         screen: picture.clone(),
         annot,
         view,
-        dim,
         ui,
         origin,
         rect,
@@ -1218,46 +1208,6 @@ impl Session {
             return Some(s.normalized());
         }
         d.hover.as_ref().map(|r| (r.x0, r.y0, r.x1, r.y1))
-    }
-
-    /// 按当前选区（或悬停窗口）摆压暗矩形
-    fn sync_dim(&self) {
-        let (sel, hover) = {
-            let d = self.doc.borrow();
-            (
-                d.sel.map(|s| s.normalized()),
-                d.hover.as_ref().map(|r| (r.x0, r.y0, r.x1, r.y1)),
-            )
-        };
-        for w in &self.wins {
-            let area = (w.rect.2 - w.rect.0, w.rect.3 - w.rect.1);
-            let rects = paint::dim_rects(paint::hole_rect(sel, hover, w.rect), area);
-            for (i, d) in w.dim.iter().enumerate() {
-                let r = rects.get(i).filter(|r| {
-                    (r.2 - r.0).round() > 0.0 && (r.3 - r.1).round() > 0.0
-                });
-                let Some(&(x0, y0, x1, y1)) = r else {
-                    if d.is_visible() {
-                        d.set_visible(false);
-                    }
-                    continue;
-                };
-                let (x, y) = (x0.round() as i32, y0.round() as i32);
-                let (bw, bh) = ((x1 - x0).round() as i32, (y1 - y0).round() as i32);
-                if d.margin_start() != x {
-                    d.set_margin_start(x);
-                }
-                if d.margin_top() != y {
-                    d.set_margin_top(y);
-                }
-                if d.width_request() != bw || d.height_request() != bh {
-                    d.set_size_request(bw, bh);
-                }
-                if !d.is_visible() {
-                    d.set_visible(true);
-                }
-            }
-        }
     }
 
     /// 让标注层只覆盖会画出东西的那一块：选区（或悬停窗口）加余量
@@ -1319,7 +1269,6 @@ impl Session {
             }
         }
         self.last_redraw = Some(t);
-        self.sync_dim();
         self.sync_annot();
         let next = self.dirty_rect();
         let dirty = match (self.dirty, next) {

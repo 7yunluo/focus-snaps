@@ -38,48 +38,6 @@ pub fn annot_rect(live: Option<Rect4>, out_rect: Rect4) -> Option<Rect4> {
     }
 }
 
-/// 压暗要挖的洞：选区（或悬停窗口）跟本屏的交集，换算成本屏局部坐标
-///
-/// 跨屏选区时每块屏挖自己这一段的洞，拼起来就是连续的一块。
-pub fn hole_rect(sel: Option<Rect4>, hover: Option<Rect4>, out_rect: Rect4) -> Option<Rect4> {
-    let g = sel
-        .and_then(|s| intersect(s, out_rect))
-        .or_else(|| hover.and_then(|h| intersect(h, out_rect)))?;
-    Some((
-        g.0 - out_rect.0,
-        g.1 - out_rect.1,
-        g.2 - out_rect.0,
-        g.3 - out_rect.1,
-    ))
-}
-
-/// 压暗用的矩形：洞以外的部分切成上、下、左、右四块（本屏局部坐标）
-///
-/// 没有洞就是整屏一块。这些矩形交给 CSS 画，合成器填实心色块不花钱，
-/// 比每帧让 cairo 调一遍 blend 便宜得多。
-pub fn dim_rects(hole: Option<Rect4>, area: (f64, f64)) -> Vec<Rect4> {
-    let (w, h) = area;
-    let Some((x0, y0, x1, y1)) = hole else {
-        return if w > 0.0 && h > 0.0 {
-            vec![(0.0, 0.0, w, h)]
-        } else {
-            Vec::new()
-        };
-    };
-    let mut out = Vec::with_capacity(4);
-    for r in [
-        (0.0, 0.0, w, y0),
-        (0.0, y1, w, h),
-        (0.0, y0, x0, y1),
-        (x1, y0, w, y1),
-    ] {
-        if r.2 > r.0 && r.3 > r.1 {
-            out.push(r);
-        }
-    }
-    out
-}
-
 /// 画一个显示器上随交互变化的那一层：悬停框、标注、选区边框
 ///
 /// 屏幕画面在下层由 GtkPicture 合成、压暗在上层由 CSS 矩形铺，这里都不管。
@@ -117,6 +75,25 @@ pub fn paint(
     // 之后统一按全局逻辑坐标画，只是把原点挪到画布左上角
     let _ = cr.save();
     cr.translate(-view.0, -view.1);
+
+    // 亮洞：把本屏画面按物理分辨率 1:1 贴进选区（还没框选时贴悬停的窗口）。
+    // 压暗是底下固定的一整块，所以外面那份画面是暗的，只有这一块是原亮度。
+    let bright = sel.or(hover.filter(|h| intersect(*h, out_rect).is_some()));
+    if let Some((bx0, by0, bx1, by1)) = bright.and_then(|r| intersect(r, out_rect)) {
+        if let Some(phys) = outs.get_mut(out_idx).and_then(|o| o.ensure_phys()) {
+            let _ = cr.save();
+            cr.rectangle(bx0, by0, bx1 - bx0, by1 - by0);
+            cr.clip();
+            cr.translate(-origin.0, -origin.1);
+            cr.scale(1.0 / sx, 1.0 / sy);
+            // 1:1 贴的，别让 cairo 去插值
+            let pat = cairo::SurfacePattern::create(&*phys);
+            pat.set_filter(cairo::Filter::Nearest);
+            let _ = cr.set_source(&pat);
+            let _ = cr.paint();
+            let _ = cr.restore();
+        }
+    }
 
     let Some((x0, y0, x1, y1)) = sel else {
         // 还没框选时，把指针悬停的窗口勾出来
@@ -643,99 +620,6 @@ mod tests {
 
     fn gray(data: &[u8], w: usize, x: usize, y: usize) -> u8 {
         data[(y * w + x) * 4 + 1]
-    }
-
-    /// 把遮罩矩形叠到浅灰底上，模拟 CSS 实心矩形压在画面之上
-    fn render_dim(hole: Option<Rect4>, w: i32, h: i32) -> (Vec<u8>, usize) {
-        let mut target = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).unwrap();
-        {
-            let cr = cairo::Context::new(&target).unwrap();
-            cr.set_source_rgb(200.0 / 255.0, 200.0 / 255.0, 200.0 / 255.0);
-            let _ = cr.paint();
-            cr.set_source_rgba(0.0, 0.0, 0.0, DIM);
-            for (x0, y0, x1, y1) in dim_rects(hole, (f64::from(w), f64::from(h))) {
-                cr.rectangle(x0, y0, x1 - x0, y1 - y0);
-            }
-            let _ = cr.fill();
-            let _ = cr.show_page();
-        }
-        let mut data = vec![0u8; (w * h * 4) as usize];
-        {
-            let stride = target.stride() as usize;
-            let src = target.data().unwrap();
-            for y in 0..h as usize {
-                let s = y * stride;
-                data[y * w as usize * 4..(y + 1) * w as usize * 4]
-                    .copy_from_slice(&src[s..s + w as usize * 4]);
-            }
-        }
-        (data, w as usize)
-    }
-
-    #[test]
-    fn dim_keeps_hole_bright_and_darkens_outside() {
-        let out_rect = (0.0, 0.0, 400.0, 200.0);
-        let hole = hole_rect(Some((100.0, 50.0, 200.0, 100.0)), None, out_rect);
-        let (data, w) = render_dim(hole, 400, 200);
-        // 洞里保持原亮度
-        assert!(gray(&data, w, 150, 75) >= 195, "洞里 {}", gray(&data, w, 150, 75));
-        assert!(gray(&data, w, 105, 55) >= 195);
-        // 洞外被压暗（0.45 黑）
-        assert!(gray(&data, w, 10, 10) <= 120, "洞外 {}", gray(&data, w, 10, 10));
-        assert!(gray(&data, w, 380, 180) <= 120);
-        // 洞的上下边界外也要压暗
-        assert!(gray(&data, w, 150, 104) <= 120, "下侧 {}", gray(&data, w, 150, 104));
-        assert!(gray(&data, w, 150, 44) <= 120, "上侧 {}", gray(&data, w, 150, 44));
-    }
-
-    #[test]
-    fn dim_hole_follows_each_output() {
-        // 两块 200x100 逻辑的屏并排，选区从第一块横跨到第二块
-        let sel = (150.0, 20.0, 250.0, 60.0);
-        let left = (0.0, 0.0, 200.0, 100.0);
-        let right = (200.0, 0.0, 400.0, 100.0);
-        // 第一块屏：本屏 x 150..200 那一段是洞，其余压暗
-        let (data, w) = render_dim(hole_rect(Some(sel), None, left), 200, 100);
-        assert!(gray(&data, w, 160, 40) >= 195, "左屏洞里 {}", gray(&data, w, 160, 40));
-        assert!(gray(&data, w, 100, 40) <= 120, "左屏洞外 {}", gray(&data, w, 100, 40));
-        assert!(gray(&data, w, 110, 90) <= 120, "左屏洞下方 {}", gray(&data, w, 110, 90));
-        // 第二块屏：本屏 x 0..50 那一段是洞，右边压暗
-        let (data, w) = render_dim(hole_rect(Some(sel), None, right), 200, 100);
-        assert!(gray(&data, w, 25, 40) >= 195, "右屏洞里 {}", gray(&data, w, 25, 40));
-        assert!(gray(&data, w, 100, 40) <= 120, "右屏洞外 {}", gray(&data, w, 100, 40));
-    }
-
-    #[test]
-    fn dim_covers_whole_screen_without_hole() {
-        let (data, w) = render_dim(None, 400, 200);
-        assert!(gray(&data, w, 0, 0) <= 120);
-        assert!(gray(&data, w, 200, 100) <= 120);
-        // 还没框选时，悬停的窗口也能当洞
-        let out_rect = (0.0, 0.0, 400.0, 200.0);
-        let hover = (10.0, 10.0, 60.0, 60.0);
-        assert_eq!(hole_rect(None, Some(hover), out_rect), Some(hover));
-        // 洞铺满整屏时不该产生任何矩形
-        assert!(dim_rects(Some(out_rect), (400.0, 200.0)).is_empty());
-    }
-
-    #[test]
-    fn degenerate_selection_leaves_no_hole() {
-        let out_rect = (0.0, 0.0, 400.0, 200.0);
-        for (x0, y0) in [(0.0, 0.0), (399.0, 199.0), (200.0, 100.0)] {
-            assert_eq!(
-                hole_rect(Some((x0, y0, x0, y0)), None, out_rect),
-                None,
-                "零面积选区不该挖洞"
-            );
-        }
-        // 反向选区先归一化，照样挖洞
-        assert_eq!(
-            hole_rect(Some((100.0, 50.0, 300.0, 150.0)), None, out_rect),
-            Some((100.0, 50.0, 300.0, 150.0))
-        );
-        // 选区完全在别的屏上时，本屏整块压暗
-        assert_eq!(hole_rect(Some((500.0, 50.0, 600.0, 80.0)), None, out_rect), None);
-        assert_eq!(dim_rects(None, (400.0, 200.0)), vec![(0.0, 0.0, 400.0, 200.0)]);
     }
 
     #[test]
