@@ -109,7 +109,6 @@ fn acquire_lock() -> bool {
 }
 
 pub fn run(opts: Options) -> i32 {
-    gtk::Window::set_default_icon_name("focus-snaps");
     if !acquire_lock() {
         eprintln!("已经有一个截图浮层开着");
         crate::export::notify("FocusSnapS", "已经有一个截图浮层开着");
@@ -141,6 +140,8 @@ pub fn run(opts: Options) -> i32 {
 
 /// 建好所有显示器的浮层并显示
 fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
+    // 这里已在 gtk::init 之后，可以设默认图标
+    gtk::Window::set_default_icon_name("focus-snaps");
     if !gtk4_layer_shell::is_supported() {
         return Err("当前合成器不支持 wlr-layer-shell".into());
     }
