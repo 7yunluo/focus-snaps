@@ -999,6 +999,10 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
         });
     }
 
+    // 指针移动控制器：拖动期间会被关掉——gesture 已经覆盖同一批事件，
+    // 两边都处理等于每个指针事件干两遍
+    let motion = gtk::EventControllerMotion::new();
+
     // 拖拽：框选 / 调整 / 移动 / 画标注
     {
         let sess = sess.clone();
@@ -1006,7 +1010,10 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
         drag.set_button(1);
         drag.connect_drag_begin({
             let sess = sess.clone();
+            let motion = motion.clone();
             move |_g, x, y| {
+                // 拖动期间指针事件只走 gesture
+                motion.set_propagation_phase(gtk::PropagationPhase::None);
                 let mut s = sess.borrow_mut();
                 on_drag_begin(&mut s, idx, x + origin.0, y + origin.1);
                 s.redraw();
@@ -1024,7 +1031,9 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
         });
         drag.connect_drag_end({
             let sess = sess.clone();
+            let motion = motion.clone();
             move |_g, ox, oy| {
+                motion.set_propagation_phase(gtk::PropagationPhase::Bubble);
                 let mut s = sess.borrow_mut();
                 let anchor = s.drag.anchor;
                 on_drag_end(&mut s, idx, anchor.0 + ox, anchor.1 + oy);
@@ -1056,7 +1065,6 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
     // 指针进入哪块屏就把键盘焦点交给它；移动时更新悬停窗口
     {
         let sess = sess.clone();
-        let motion = gtk::EventControllerMotion::new();
         motion.connect_enter({
             let sess = sess.clone();
             move |_c, x, y| {
