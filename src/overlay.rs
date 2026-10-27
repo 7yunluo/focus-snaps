@@ -114,18 +114,22 @@ enum Export {
 
 type SessionRef = Rc<RefCell<Session>>;
 
-/// 启动后两秒内盯一眼主循环有没有被自己卡住
+/// 主线程卡住时的现场取证（只在 FOCUSSNAPS_TRACE 下启用）
 ///
-/// 浮层出来之后用户往往立刻就开始拖框，这时候主线程要是被我们自己的一段活
-/// 占住（历史上是取像素的纹理下载，44 MB 一次 70 ms），拖动就会卡一下，
-/// 甚至整个按下-拖动被吞掉。跑 `FOCUSSNAPS_TRACE=1` 看到这条就知道是它。
+/// 光知道「主循环卡了 N 毫秒」定不了案：可能是我们的回调在跑、可能在等某个
+/// syscall、也可能根本没被系统调度（内存压力、被饿死）。这里挂一个 5 ms 的
+/// 心跳加上一个后台看门狗，卡住超过 300 ms 就把内核层面的现场打出来：
+/// 线程在哪个内核函数上等着（wchan）、这期间烧了多少 CPU、状态码、内存占用。
 fn watch_stalls() {
+    use std::sync::atomic::{AtomicU64, Ordering};
     if std::env::var_os("FOCUSSNAPS_TRACE").is_none() {
         return;
     }
+    static BEAT: AtomicU64 = AtomicU64::new(0);
     let start = std::time::Instant::now();
     let last = std::cell::Cell::new(start);
     glib::timeout_add_local(std::time::Duration::from_millis(5), move || {
+        BEAT.fetch_add(1, Ordering::Relaxed);
         let now = std::time::Instant::now();
         let gap = now.duration_since(last.get()).as_millis();
         last.set(now);
@@ -136,12 +140,62 @@ fn watch_stalls() {
                 now.duration_since(start).as_millis()
             ));
         }
-        if now.duration_since(start).as_millis() > 2000 {
-            glib::ControlFlow::Break
-        } else {
-            glib::ControlFlow::Continue
+        glib::ControlFlow::Continue
+    });
+
+    // 主线程的 tid（gettid 在这里调，本函数就是在主线程上跑的）
+    let tid = unsafe { libc::gettid() };
+    std::thread::spawn(move || {
+        let mut last_beat = 0;
+        let mut last_cpu = 0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let beat = BEAT.load(Ordering::Relaxed);
+            if beat != last_beat {
+                last_beat = beat;
+                last_cpu = thread_cpu_ticks(tid).unwrap_or(0);
+                continue;
+            }
+            // 主线程 300 ms 没心跳了：把现场打出来
+            let cpu = thread_cpu_ticks(tid).unwrap_or(0);
+            let state = proc_field("/proc/self/stat", 2).unwrap_or_default();
+            let wchan = std::fs::read_to_string(format!("/proc/self/task/{tid}/wchan"))
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default();
+            let rss = std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|t| {
+                    t.lines()
+                        .find(|l| l.starts_with("VmRSS"))
+                        .map(|l| l.split_whitespace().nth(1).unwrap_or("?").to_string())
+                })
+                .unwrap_or_default();
+            trace(&format!(
+                "主线程停住了：状态 {state}，卡在 {wchan}，这 300 ms 烧了 {} ms CPU，RSS {rss} kB，最后在「{}」",
+                (cpu.saturating_sub(last_cpu)) * 10,
+                phase_name(PHASE.load(std::sync::atomic::Ordering::Relaxed))
+            ));
+            last_cpu = cpu;
         }
     });
+}
+
+/// 某个线程累计的 CPU 时间（单位 jiffies，一般 10 ms 一个）
+fn thread_cpu_ticks(tid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
+    // 第 2 个字段是线程名，里面可能有空格和括号，从右往左数才稳
+    let rest = stat.rsplit_once(')')?.1;
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    // utime、stime 在整行里是第 14、15 个字段；括号之后从 state（第 3 个）开始
+    let utime: u64 = f.get(11)?.parse().ok()?;
+    let stime: u64 = f.get(12)?.parse().ok()?;
+    Some(utime + stime)
+}
+
+/// 读 /proc 里某个文件的第 n 个空白分隔字段（从 0 开始）
+fn proc_field(path: &str, n: usize) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.split_whitespace().nth(n).map(|s| s.to_string())
 }
 
 /// 启动阶段打点：设了 FOCUSSNAPS_TRACE 就往 stderr 打时间戳
@@ -150,8 +204,39 @@ fn watch_stalls() {
 pub(crate) fn trace(msg: &str) {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let t = START.get_or_init(std::time::Instant::now);
-    if std::env::var_os("FOCUSSNAPS_TRACE").is_some() {
+    if trace_on() {
         eprintln!("[trace] +{:>4} ms  {msg}", t.elapsed().as_millis());
+    }
+}
+
+/// 是不是开了 tracing（热路径上每次都要问，缓存住）
+pub(crate) fn trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FOCUSSNAPS_TRACE").is_some())
+}
+
+/// 主线程眼下进到哪一段了
+///
+/// 主线程空转的时候抓不到栈（ptrace 受限），只能靠这个记号告诉看门狗
+/// 最后进的是哪一段。
+pub(crate) static PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub(crate) fn phase(p: u8) {
+    if trace_on() {
+        PHASE.store(p, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn phase_name(p: u8) -> &'static str {
+    match p {
+        1 => "帧时钟回调（基准）",
+        2 => "redraw",
+        3 => "标注层绘制",
+        4 => "亮洞绘制",
+        5 => "拖动更新",
+        6 => "指针手势",
+        8 => "同步图层位置",
+        _ => "主循环空闲",
     }
 }
 
@@ -425,6 +510,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
             let dir = std::cell::Cell::new((1.0f64, 1.0f64));
             let dragging = std::cell::Cell::new(0usize);
             w.annot.add_tick_callback(move |w, _clock| {
+                phase(1);
                 if drag {
                     if let Ok(mut s) = quit.try_borrow_mut() {
                         let bbox = s.doc.borrow().bbox();
@@ -1046,6 +1132,7 @@ fn schedule_pointer(sess: &SessionRef) {
         };
         s.pointer_queued = false;
         if let Some((i, x, y)) = s.pending_drag.take() {
+            phase(5);
             on_drag_update(&mut s, i, x, y);
             s.redraw();
         }
@@ -1164,6 +1251,7 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
         let drawn = std::cell::Cell::new(false);
         let overlay2 = overlay.clone();
         annot.set_draw_func(move |a, cr, _w, _h| {
+            phase(3);
             if !drawn.get() {
                 drawn.set(true);
                 trace("首帧光栅化");
@@ -1188,6 +1276,8 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
                 .map(|b| (origin.0 + f64::from(b.x()), origin.1 + f64::from(b.y())))
                 .unwrap_or_else(|| view.get());
             paint::paint(cr, &mut doc, idx, view, preview);
+            // 出来就把记号清掉：卡在这儿的是我们，卡在别处就不是
+            phase(0);
         });
     }
 
@@ -1204,6 +1294,7 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
             let sess = sess.clone();
             let motion = motion.clone();
             move |_g, x, y| {
+                phase(6);
                 // 拖动期间指针事件只走 gesture
                 motion.set_propagation_phase(gtk::PropagationPhase::None);
                 let mut s = sess.borrow_mut();
@@ -1217,6 +1308,7 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
         drag.connect_drag_update({
             let sess = sess.clone();
             move |_g, ox, oy| {
+                phase(6);
                 // 高回报率鼠标一秒能报上千个位置，同一帧里只处理最新那个：
                 // 每个事件都跑一遍几何计算和 widget 更新纯属浪费
                 let anchor = sess.borrow().drag.anchor;
@@ -1228,6 +1320,7 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
             let sess = sess.clone();
             let motion = motion.clone();
             move |_g, ox, oy| {
+                phase(6);
                 motion.set_propagation_phase(gtk::PropagationPhase::Bubble);
                 let mut s = sess.borrow_mut();
                 let anchor = s.drag.anchor;
@@ -1439,6 +1532,7 @@ impl Session {
     /// 以前这层铺满整屏，每帧都要把整块屏（5120x2160 是 44 MB）重新光栅化
     /// 并上传成纹理；缩到选区大小之后，拖拽时每帧只有几个像素的活要干。
     fn sync_annot(&self) {
+        phase(8);
         let live = {
             let d = self.doc.borrow();
             match d.sel {
@@ -1464,7 +1558,9 @@ impl Session {
                 continue;
             };
             // 洞：不加余量，边界和选区严丝合缝
-            let hole = paint::hole_rect(live, w.rect).filter(|r| {
+            let hole = paint::hole_rect(live, w.rect)
+                .filter(|_| std::env::var_os("FOCUSSNAPS_NO_HOLE").is_none())
+                .filter(|r| {
                 (r.2 - r.0).round() as i32 > 0 && (r.3 - r.1).round() as i32 > 0
             });
             match hole {
@@ -1523,6 +1619,7 @@ impl Session {
 
     /// 重绘：只刷「新旧脏区」碰到的屏，跨屏拖动时相关的那几块一起刷
     fn redraw(&mut self) {
+        phase(2);
         let t = std::time::Instant::now();
         if let Some(prev) = self.last_redraw {
             let gap = t.duration_since(prev).as_millis();
@@ -1546,6 +1643,7 @@ impl Session {
             }
         }
         let cost = t.elapsed().as_millis();
+        phase(0);
         // 我们自己的这一趟要是一直很慢就是代码问题
         if cost > 10 {
             trace(&format!("redraw 本身花了 {cost} ms"));

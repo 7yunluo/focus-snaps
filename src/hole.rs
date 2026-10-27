@@ -40,6 +40,7 @@ mod imp {
 
     impl WidgetImpl for Hole {
         fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            crate::overlay::phase(4);
             let Some(tex) = self.texture.borrow().clone() else {
                 return;
             };

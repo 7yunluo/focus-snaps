@@ -238,3 +238,35 @@ c.run(bin, 2000, "1300,300,600,400") / 2000
 `ydotool` 别用：这台机器上 `ydotoold` 没在跑时命令会静默失败，
 `mousedown`/`mouseup` 也不是它的子命令（只有 `click`），
 拿它测「输入有没有丢」会得出完全错误的结论。
+
+## 「负载高的时候拖动卡、甚至卡一秒」怎么定位（还没定案）
+
+现象：跑 `pnpm vite build` 的时候按热键调出浮层再拖框，帧率掉到一两秒一帧，
+而同时 niri 自己滚动、切工作区都很流畅。
+
+定位过程（这些手段都留在代码里了，`FOCUSSNAPS_TRACE=1` 就能用）：
+
+1. **先分清是「被抢 CPU」「在等 syscall」还是「在空转」**。`watch_stalls` 除了
+   5 ms 心跳，还起了一个后台看门狗：主线程 300 ms 没心跳就把
+   `/proc/self/task/<tid>/wchan`、状态码（R/S/D）和这 300 ms 烧掉的 CPU 打出来。
+   本机的实测是 **状态 R + 跑满一个核 + wchan 为 0**，也就是在用户态空转，
+   不是被饿死、也不是在等 I/O。
+2. **再看空转在哪一段**。主线程抓不到栈（`ptrace_scope=1`，`eu-stack -p` 即使
+   父进程来抓也是 EPERM），所以每个热点入口都埋了 `phase()` 记号，看门狗会把
+   「最后在「XX」」一并打出来。记号在回调返回时清 0——**报「主循环空闲」就说明
+   时间花在我们自己的回调之外**（GSK 渲染 / GL / GDK 内部）。
+3. **用纯 CPU 负载复现不了**：44 个忙循环（load 23，比真实构建还高）下 0 次卡顿；
+   用真实的 `pnpm vite build` 一跑就是 20 次。区别不在 CPU，而在**内存压力**：
+   这台机器 `/proc/pressure/memory` 的 `full` 平时就有几个百分点，构建时能冲到
+   30% 以上（显存倒是只用 31%）。
+4. **渲染器是分水岭**：默认（ngl）和 `GSK_RENDERER=vulkan` 都会空转，
+   `GSK_RENDERER=gl` 在同样的负载下能跑满 120 fps。
+
+结论（尚未修复）：时间花在 GSK 渲染上、且只在新渲染器下出现，最可疑的是亮洞里
+那个**边界等于整屏的 `GskTextureNode`**（这是个 4.16 起就废弃的节点，靠
+`push_clip` 裁成一小块用）。要把范围再缩小可以直接 A/B：
+
+```sh
+FOCUSSNAPS_NO_HOLE=1 FOCUSSNAPS_TRACE=1 ...   # 关掉亮洞那一层
+GSK_RENDERER=gl FOCUSSNAPS_TRACE=1 ...        # 换渲染器
+```
