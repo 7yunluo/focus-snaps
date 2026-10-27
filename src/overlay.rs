@@ -1385,7 +1385,16 @@ fn on_drag_update(s: &mut Session, _idx: usize, x: f64, y: f64) {
             let mut d = s.doc.borrow_mut();
             if let Some(a) = d.active.as_mut() {
                 if a.tool.is_freehand() {
-                    a.points.push((x, y));
+                    // 高回报率鼠标一次拖动能报上千个点，轨迹画起来是线性的，
+                    // 间距不到 1 个逻辑像素的点直接丢掉，画出来看不出差别
+                    let far = a
+                        .points
+                        .last()
+                        .map(|p| (p.0 - x).abs() >= 1.0 || (p.1 - y).abs() >= 1.0)
+                        .unwrap_or(true);
+                    if far {
+                        a.points.push((x, y));
+                    }
                 } else {
                     a.points.truncate(1);
                     a.points.push((x, y));
@@ -1394,7 +1403,8 @@ fn on_drag_update(s: &mut Session, _idx: usize, x: f64, y: f64) {
         }
         DragKind::None => {}
     }
-    s.sync_ui();
+    // 这里不调 sync_ui：拖动期间工具条本来就藏起来了，位置和可见性都不会变，
+    // 每个指针事件跑一遍只是白做 GTK 布局和光标设置。松手时 on_drag_end 会同步。
 }
 
 fn on_drag_end(s: &mut Session, idx: usize, x: f64, y: f64) {
