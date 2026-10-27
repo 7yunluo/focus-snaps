@@ -117,43 +117,48 @@ pub fn render_selection(doc: &mut Doc) -> Result<cairo::ImageSurface, String> {
 }
 
 /// 画布转 RGBA8 字节
-fn surface_rgba(surface: &mut cairo::ImageSurface) -> Result<(Vec<u8>, i32, i32), String> {
+/// 画布转 RGBA 像素
+///
+/// 通道顺序要换一下（cairo 的 ARGB32 在内存里是 BGRX）。按 4 字节一组整块处理，
+/// 比逐像素按下标读写快得多，整屏 1100 万像素也就十几毫秒。
+pub fn surface_rgba(surface: &mut cairo::ImageSurface) -> Result<(Vec<u8>, i32, i32), String> {
     let w = surface.width() as usize;
     let h = surface.height() as usize;
     let stride = surface.stride() as usize;
     let data = surface.data().map_err(|e| format!("读取画布失败: {e}"))?;
     let mut out = vec![0u8; w * h * 4];
     for y in 0..h {
-        let src = y * stride;
-        let dst = y * w * 4;
-        let srow = &data[src..src + w * 4];
-        let drow = &mut out[dst..dst + w * 4];
-        for x in 0..w {
-            let i = x * 4;
-            drow[i] = srow[i + 2];
-            drow[i + 1] = srow[i + 1];
-            drow[i + 2] = srow[i];
-            drow[i + 3] = srow[i + 3];
+        let srow = &data[y * stride..y * stride + w * 4];
+        let drow = &mut out[y * w * 4..(y + 1) * w * 4];
+        for (s, d) in srow.chunks_exact(4).zip(drow.chunks_exact_mut(4)) {
+            d[0] = s[2];
+            d[1] = s[1];
+            d[2] = s[0];
+            d[3] = s[3];
         }
     }
     Ok((out, w as i32, h as i32))
 }
 
-/// 编码 PNG
-pub fn encode_png(surface: &mut cairo::ImageSurface) -> Result<Vec<u8>, String> {
+/// 从 RGBA 像素编码 PNG，不碰任何 GTK 对象，可以丢到别的线程上跑
+pub fn encode_png_rgba(rgba: &[u8], w: i32, h: i32) -> Result<Vec<u8>, String> {
     use image::ImageEncoder;
-    let (rgba, w, h) = surface_rgba(surface)?;
     let mut out = Vec::new();
     image::codecs::png::PngEncoder::new(&mut out)
-        .write_image(&rgba, w as u32, h as u32, image::ExtendedColorType::Rgba8)
+        .write_image(rgba, w as u32, h as u32, image::ExtendedColorType::Rgba8)
         .map_err(|e| format!("编码 PNG 失败: {e}"))?;
     Ok(out)
 }
 
-/// 画布转剪贴板纹理
-pub fn surface_texture(surface: &mut cairo::ImageSurface) -> Result<gdk::Texture, String> {
+/// 编码 PNG
+pub fn encode_png(surface: &mut cairo::ImageSurface) -> Result<Vec<u8>, String> {
     let (rgba, w, h) = surface_rgba(surface)?;
-    let bytes = glib::Bytes::from(&rgba);
+    encode_png_rgba(&rgba, w, h)
+}
+
+/// RGBA 像素转剪贴板纹理
+pub fn texture_from_rgba(rgba: &[u8], w: i32, h: i32) -> Result<gdk::Texture, String> {
+    let bytes = glib::Bytes::from(rgba);
     Ok(gdk::MemoryTexture::new(
         w,
         h,
@@ -186,6 +191,17 @@ pub fn save_to_dir(surface: &mut cairo::ImageSurface, dir: &str) -> Result<PathB
     std::fs::create_dir_all(dir).map_err(|e| format!("创建目录失败: {e}"))?;
     let path = unique_path(Path::new(dir), &stamp());
     let bytes = encode_png(surface)?;
+    std::fs::write(&path, bytes).map_err(|e| format!("写入文件失败: {e}"))?;
+    Ok(path)
+}
+
+/// 把 RGBA 像素编码后落到图片目录，返回落盘路径
+///
+/// 和 save_to_dir 等价，只是不依赖 cairo 画布，可以拿到后台线程上跑。
+pub fn save_rgba_png(rgba: &[u8], w: i32, h: i32, dir: &str) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    let path = unique_path(Path::new(dir), &stamp());
+    let bytes = encode_png_rgba(rgba, w, h)?;
     std::fs::write(&path, bytes).map_err(|e| format!("写入文件失败: {e}"))?;
     Ok(path)
 }

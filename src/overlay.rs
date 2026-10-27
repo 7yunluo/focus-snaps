@@ -88,8 +88,10 @@ struct Session {
     theme_watch: Option<gio::Settings>,
     /// 当前持有键盘焦点的窗口
     focused: Option<usize>,
-    /// 上���次单击（时间 + 位置），用于识别双击
+    /// 上次单击（时间 + 位置），用于识别双击
     last_click: Option<(std::time::Instant, (f64, f64))>,
+    /// 已经甩给后台线程在导出，别再来一次
+    exporting: bool,
 }
 
 type SessionRef = Rc<RefCell<Session>>;
@@ -264,6 +266,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         theme_watch: None,
         focused: None,
         last_click: None,
+        exporting: false,
     }));
 
     for (idx, monitor) in picks.iter().enumerate() {
@@ -459,7 +462,15 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
                 glib::timeout_add_local_once(
                     std::time::Duration::from_millis(250),
                     move || {
-                        let s = sess2.borrow_mut();
+                        let mut s = sess2.borrow_mut();
+                        // 「@」表示走真实的保存路径（后台线程 + 默认目录），
+                        // 否则就按给定路径同步存一份，方便脚本直接拿文件
+                        if path == "@" {
+                            let idx = s.doc.borrow().sel_output();
+                            s.do_save(idx);
+                            return;
+                        }
+                        let s = s;
                         let mut doc = s.doc.borrow_mut();
                         match crate::export::render_selection(&mut doc).and_then(|mut surf| {
                             crate::export::save_to_path(&mut surf, &path)
@@ -1073,63 +1084,112 @@ impl Session {
 
     /// 复制选区并退出
     fn do_copy(&mut self, idx: Option<usize>) {
+        if self.exporting {
+            return;
+        }
         self.ensure_selection(idx);
-        let clipboard = self
-            .win_of(self.doc.borrow().sel_output().unwrap_or(0))
-            .or_else(|| self.wins.first())
-            .map(|w| w.window.clipboard());
-        let mut surface = {
-            let mut doc = self.doc.borrow_mut();
-            match export::render_selection(&mut doc) {
-                Ok(s) => s,
+        let Some((rgba, w, h)) = self.report(self.render_rgba(), "复制失败") else {
+            return;
+        };
+        self.exporting = true;
+        let rgba = std::sync::Arc::new(rgba);
+        let worker = rgba.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        std::thread::spawn(move || {
+            let copied = match export::encode_png_rgba(&worker, w, h) {
+                Ok(png) => export::copy_png_via_wl_copy(&png).is_ok(),
                 Err(e) => {
                     eprintln!("复制失败: {e}");
-                    return;
+                    false
                 }
-            }
-        };
-        let png = export::encode_png(&mut surface);
-        if let Ok(png) = png {
-            if export::copy_png_via_wl_copy(&png).is_ok() {
+            };
+            let _ = tx.send(copied);
+        });
+        let app = self.app.clone();
+        when_done(rx, move |copied| {
+            if copied {
                 export::notify("FocusSnapS", "已复制到剪贴板");
-                self.app.quit();
+                app.quit();
                 return;
             }
-        }
-        match clipboard {
-            Some(cb) => match export::surface_texture(&mut surface) {
-                Ok(texture) => {
-                    cb.set_texture(&texture);
-                    self.app.quit();
-                }
-                Err(e) => eprintln!("复制失败: {e}"),
-            },
-            None => eprintln!("复制失败: 没有可用窗口"),
-        }
+            // wl-copy 用不了就退回 GTK 剪贴板，这一步只能在主线程做
+            let clipboard = app
+                .windows()
+                .first()
+                .and_then(|w| w.clone().downcast::<gtk::ApplicationWindow>().ok())
+                .map(|w| w.clipboard());
+            match (clipboard, export::texture_from_rgba(&rgba, w, h)) {
+                (Some(cb), Ok(texture)) => cb.set_texture(&texture),
+                (Some(_), Err(e)) => eprintln!("复制失败: {e}"),
+                (None, _) => eprintln!("复制失败: 没有可用窗口"),
+            }
+            app.quit();
+        });
     }
 
     /// 保存选区并退出
     fn do_save(&mut self, idx: Option<usize>) {
+        if self.exporting {
+            return;
+        }
         self.ensure_selection(idx);
         let dir = self.doc.borrow().dir.clone();
-        let mut doc = self.doc.borrow_mut();
-        let mut surface = match export::render_selection(&mut doc) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("保存失败: {e}");
-                return;
-            }
+        let Some((rgba, w, h)) = self.report(self.render_rgba(), "保存失败") else {
+            return;
         };
-        drop(doc);
-        match export::save_to_dir(&mut surface, &dir) {
-            Ok(path) => {
-                println!("{}", path.display());
-                export::notify("截图已保存", &path.display().to_string());
-                self.app.quit();
+        self.exporting = true;
+        let (tx, rx) = std::sync::mpsc::channel::<Result<std::path::PathBuf, String>>();
+        std::thread::spawn(move || {
+            let _ = tx.send(export::save_rgba_png(&rgba, w, h, &dir));
+        });
+        let app = self.app.clone();
+        when_done(rx, move |saved| {
+            match saved {
+                Ok(path) => {
+                    println!("{}", path.display());
+                    export::notify("截图已保存", &path.display().to_string());
+                }
+                Err(e) => eprintln!("保存失败: {e}"),
             }
-            Err(e) => eprintln!("保存失败: {e}"),
+            app.quit();
+        });
+    }
+
+    /// 把选区渲染成 RGBA 像素
+    ///
+    /// 这一步要用 cairo 画布，只能在主线程做；后面的编码、写盘、喂给 wl-copy
+    /// 都是几百毫秒的活，全甩给后台线程。
+    fn render_rgba(&self) -> Result<(Vec<u8>, i32, i32), String> {
+        let mut doc = self.doc.borrow_mut();
+        let mut surface = export::render_selection(&mut doc)?;
+        export::surface_rgba(&mut surface)
+    }
+
+    /// 出错就打一行日志并返回 None
+    fn report<T>(&self, r: Result<T, String>, what: &str) -> Option<T> {
+        match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("{what}: {e}");
+                None
+            }
         }
     }
+}
+
+/// 等后台线程把结果送回来，再在主线程上收尾
+fn when_done<T: Send + 'static>(rx: std::sync::mpsc::Receiver<T>, done: impl Fn(T) + 'static) {
+    glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+        match rx.try_recv() {
+            Ok(v) => {
+                done(v);
+                glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            // 线程没了却没送回结果，只能作罢
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        }
+    });
 }
 
 /// 列出所有显示器
