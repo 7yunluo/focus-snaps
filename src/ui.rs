@@ -70,6 +70,8 @@ pub struct Ui {
     /// 调色板里的色块按钮与各自的颜色
     swatches: Rc<RefCell<Vec<(gtk::Button, (f64, f64, f64))>>>,
     tool_buttons: Vec<gtk::ToggleButton>,
+    /// 线宽 / 文字字号的调节器
+    pub width_spin: gtk::SpinButton,
     /// 缓存的自然尺寸，避免每次拖动都重新 measure
     natural: Cell<Option<(f64, f64)>>,
 }
@@ -81,6 +83,25 @@ impl Ui {
         root.set_halign(gtk::Align::Start);
         root.set_valign(gtk::Align::Start);
         root.set_visible(false);
+
+        // 文字输入框：透明、无边框，就地显示正在输入的文字
+        let entry = gtk::Entry::new();
+        entry.add_css_class("fs-entry");
+        // Adwaita 的 entry 背景/边框样式靠 flat 去掉
+        entry.add_css_class("flat");
+        entry.set_visible(false);
+        entry.set_halign(gtk::Align::Start);
+        entry.set_valign(gtk::Align::Start);
+        entry.set_width_chars(2);
+        style_entry(&entry, DEFAULT_COLOR, 4.0);
+        {
+            let area = area.clone();
+            let e = entry.clone();
+            entry.connect_changed(move |_| {
+                fit_entry(&e);
+                area.queue_draw();
+            });
+        }
 
         // 当前颜色与调色板
         let color: Rc<Cell<(f64, f64, f64)>> = Rc::new(Cell::new(DEFAULT_COLOR));
@@ -118,8 +139,17 @@ impl Ui {
                     let dot = dot.clone();
                     let swatches = swatches.clone();
                     let palette = palette.clone();
+                    let entry = entry.clone();
                     btn.connect_clicked(move |_| {
-                        doc.borrow_mut().color = c;
+                        let width = {
+                            let mut d = doc.borrow_mut();
+                            d.color = c;
+                            d.width
+                        };
+                        style_entry(&entry, c, width);
+                        if entry.get_visible() {
+                            entry.grab_focus();
+                        }
                         color.set(c);
                         dot.queue_draw();
                         for (b, sc) in swatches.borrow().iter() {
@@ -227,7 +257,10 @@ impl Ui {
                 let area = area.clone();
                 btn.connect_toggled(move |b| {
                     if b.is_active() {
-                        doc.borrow_mut().tool = tool;
+                        let mut d = doc.borrow_mut();
+                        d.tool = tool;
+                        d.text_sel = None;
+                        drop(d);
                         area.queue_draw();
                     }
                 });
@@ -267,8 +300,20 @@ impl Ui {
         spin.set_can_focus(false);
         {
             let doc = doc.clone();
+            let area = area.clone();
+            let entry = entry.clone();
             spin.connect_value_changed(move |s| {
-                doc.borrow_mut().width = s.value();
+                let (color, width) = {
+                    let mut d = doc.borrow_mut();
+                    d.width = s.value();
+                    (d.color, d.width)
+                };
+                style_entry(&entry, color, width);
+                fit_entry(&entry);
+                if entry.get_visible() {
+                    entry.grab_focus();
+                }
+                area.queue_draw();
             });
         }
         row_opts.append(&spin);
@@ -331,14 +376,6 @@ impl Ui {
 
         root.append(&row_opts);
 
-        // 文字输入框
-        let entry = gtk::Entry::new();
-        entry.add_css_class("fs-entry");
-        entry.set_width_chars(18);
-        entry.set_visible(false);
-        entry.set_halign(gtk::Align::Start);
-        entry.set_valign(gtk::Align::Start);
-
         let hint = gtk::Label::new(Some("拖动框选或点选窗口 · 回车/双击复制 · Ctrl+S 保存 · Esc 退出"));
         hint.set_can_target(false);
         hint.add_css_class("fs-hint");
@@ -356,6 +393,7 @@ impl Ui {
             color,
             swatches,
             tool_buttons,
+            width_spin: spin,
             natural: Cell::new(None),
         }
     }
@@ -427,6 +465,7 @@ impl Ui {
     pub fn sync_color(&self, color: (f64, f64, f64)) {
         self.color.set(color);
         self.dot.queue_draw();
+        style_entry(&self.entry, color, self.width_spin.value());
         for (btn, c) in self.swatches.borrow().iter() {
             if *c == color {
                 btn.add_css_class("fs-swatch-on");
@@ -563,13 +602,26 @@ pub fn load_css() {
             border-radius: 10px;
             font-size: 13px;
         }
-        .fs-entry {
-            background: rgba(24, 19, 16, 0.94);
-            color: #ffe8dc;
-            border: 1px solid rgba(255, 182, 139, 0.5);
-            border-radius: 7px;
-            padding: 3px 7px;
-            min-width: 180px;
+        .fs-entry, .fs-entry:focus, .fs-entry:focus-within {
+            background-color: transparent;
+            background-image: none;
+            border: none;
+            box-shadow: none;
+            outline: none;
+            padding: 0;
+            margin: 0;
+            min-width: 0;
+            min-height: 0;
+        }
+        .fs-entry text {
+            background-color: transparent;
+            background-image: none;
+            border: none;
+            box-shadow: none;
+            outline: none;
+            padding: 0;
+            min-width: 0;
+            min-height: 0;
         }
         ",
     );
@@ -580,4 +632,29 @@ pub fn load_css() {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     }
+}
+
+/// 让输入框按标注的字体、字号、颜色就地显示文字
+fn style_entry(entry: &gtk::Entry, color: (f64, f64, f64), width: f64) {
+    let attrs = gtk::pango::AttrList::new();
+    attrs.insert(gtk::pango::AttrString::new_family(&crate::paint::system_font_family()));
+    attrs.insert(gtk::pango::AttrInt::new_weight(gtk::pango::Weight::Bold));
+    attrs.insert(gtk::pango::AttrSize::new_size_absolute(
+        (crate::paint::text_px(width) * f64::from(gtk::pango::SCALE)) as i32,
+    ));
+    attrs.insert(gtk::pango::AttrColor::new_foreground(
+        (color.0 * 65535.0) as u16,
+        (color.1 * 65535.0) as u16,
+        (color.2 * 65535.0) as u16,
+    ));
+    entry.set_attributes(&attrs);
+}
+
+/// 让输入框宽度跟着文字走，光标停在字后面
+fn fit_entry(entry: &gtk::Entry) {
+    let mut cols = 2;
+    for c in entry.text().chars() {
+        cols += if c.is_ascii() { 1 } else { 2 };
+    }
+    entry.set_width_chars(cols);
 }

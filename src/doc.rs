@@ -95,6 +95,8 @@ pub struct Stroke {
     pub points: Vec<(f64, f64)>,
     pub text: Option<String>,
     pub number: Option<u32>,
+    /// 文字排版后的尺寸（逻辑像素）
+    pub text_size: Option<(f64, f64)>,
 }
 
 /// 选区，坐标是所在显示器的本地逻辑坐标
@@ -133,8 +135,50 @@ pub struct OutputLayer {
     pub sy: f64,
     /// 全分辨率画面，屏幕观感方向
     pub phys: cairo::ImageSurface,
+    /// 缩到逻辑尺寸的画面，浮层每帧直接贴这张
+    pub shown: cairo::ImageSurface,
     /// 这一屏上识别出来的窗口矩形（本屏逻辑坐标）
     pub windows: Vec<Rect>,
+}
+
+impl OutputLayer {
+    pub fn new(
+        size: (f64, f64),
+        sx: f64,
+        sy: f64,
+        phys: cairo::ImageSurface,
+        windows: Vec<Rect>,
+    ) -> Self {
+        let shown = resample(&phys, size);
+        Self {
+            size,
+            sx,
+            sy,
+            phys,
+            shown,
+            windows,
+        }
+    }
+}
+
+/// 把画面缩到逻辑尺寸
+fn resample(phys: &cairo::ImageSurface, size: (f64, f64)) -> cairo::ImageSurface {
+    let w = (size.0.round() as i32).max(1);
+    let h = (size.1.round() as i32).max(1);
+    let out = match cairo::ImageSurface::create(cairo::Format::ARgb32, w, h) {
+        Ok(s) => s,
+        Err(_) => phys.clone(),
+    };
+    if let Ok(cr) = cairo::Context::new(&out) {
+        let _ = cr.scale(
+            f64::from(w) / f64::from(phys.width().max(1)),
+            f64::from(h) / f64::from(phys.height().max(1)),
+        );
+        let _ = cr.set_source_surface(phys, 0.0, 0.0);
+        let _ = cr.paint();
+    }
+    out.mark_dirty();
+    out
 }
 
 /// 默认标注颜色
@@ -154,6 +198,8 @@ pub struct Doc {
     pub active: Option<Stroke>,
     /// 指针悬停的窗口（显示器下标 + 矩形）
     pub hover: Option<(usize, Rect)>,
+    /// 正在带框显示、可拖动的文字笔画下标
+    pub text_sel: Option<usize>,
 }
 
 impl Doc {
@@ -170,6 +216,7 @@ impl Doc {
             dir,
             active: None,
             hover: None,
+            text_sel: None,
         }
     }
 
@@ -183,6 +230,26 @@ impl Doc {
             .copied()
     }
 
+    /// 一笔文字的包围框（逻辑坐标）
+    pub fn text_box(&self, i: usize) -> Option<(f64, f64, f64, f64)> {
+        let s = self.strokes.get(i)?;
+        let (w, h) = s.text_size?;
+        let (x, y) = *s.points.first()?;
+        Some((x, y, x + w, y + h))
+    }
+
+    /// 点到哪一笔文字上，返回笔画下标
+    pub fn text_at(&self, out: usize, x: f64, y: f64) -> Option<usize> {
+        if self.sel.map(|s| s.out) != Some(out) {
+            return None;
+        }
+        (0..self.strokes.len()).rev().find(|i| {
+            self.text_box(*i)
+                .map(|(x0, y0, x1, y1)| x >= x0 && x <= x1 && y >= y0 && y <= y1)
+                .unwrap_or(false)
+        })
+    }
+
     /// 提交一笔标注
     pub fn commit(&mut self, stroke: Stroke) {
         self.strokes.push(stroke);
@@ -190,6 +257,7 @@ impl Doc {
     }
 
     pub fn undo(&mut self) -> bool {
+        self.text_sel = None;
         match self.strokes.pop() {
             Some(s) => {
                 self.redo.push(s);
@@ -201,6 +269,7 @@ impl Doc {
     }
 
     pub fn redo(&mut self) -> bool {
+        self.text_sel = None;
         match self.redo.pop() {
             Some(s) => {
                 self.strokes.push(s);
@@ -229,6 +298,7 @@ impl Doc {
         self.redo.clear();
         self.active = None;
         self.hover = None;
+        self.text_sel = None;
         self.next_number = 1;
     }
 }
@@ -244,4 +314,89 @@ pub fn default_dir() -> String {
         .filter(|d| !d.is_empty())
         .unwrap_or_else(|| format!("{home}/Pictures"));
     format!("{pictures}/Screenshots")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一块逻辑尺寸 lw*lh、缩放 1 的显示器画面
+    fn doc_with_sel(lw: i32, lh: i32) -> Doc {
+        let mut phys = cairo::ImageSurface::create(cairo::Format::ARgb32, lw, lh).unwrap();
+        phys.mark_dirty();
+        let mut doc = Doc::new(
+            vec![OutputLayer::new(
+                (f64::from(lw), f64::from(lh)),
+                1.0,
+                1.0,
+                phys,
+                Vec::new(),
+            )],
+            "/tmp".into(),
+        );
+        doc.sel = Some(Selection {
+            out: 0,
+            x0: 0.0,
+            y0: 0.0,
+            x1: f64::from(lw),
+            y1: f64::from(lh),
+        });
+        doc
+    }
+
+    fn push_text(doc: &mut Doc, x: f64, y: f64, size: (f64, f64), text: &str) {
+        doc.commit(Stroke {
+            tool: Tool::Text,
+            color: doc.color,
+            width: doc.width,
+            points: vec![(x, y)],
+            text: Some(text.into()),
+            number: None,
+            text_size: Some(size),
+        });
+    }
+
+    #[test]
+    fn text_box_follows_anchor_and_size() {
+        let mut doc = doc_with_sel(400, 300);
+        push_text(&mut doc, 50.0, 40.0, (100.0, 20.0), "hello");
+        let (x0, y0, x1, y1) = doc.text_box(0).unwrap();
+        assert_eq!((x0, x1), (50.0, 150.0));
+        // 文字框以落点为左上角
+        assert_eq!((y0, y1), (40.0, 60.0));
+    }
+
+    #[test]
+    fn text_at_picks_topmost_text() {
+        let mut doc = doc_with_sel(400, 300);
+        push_text(&mut doc, 50.0, 40.0, (100.0, 20.0), "lower");
+        push_text(&mut doc, 60.0, 45.0, (100.0, 20.0), "upper");
+        // 两块重叠的地方取后画的那一笔
+        assert_eq!(doc.text_at(0, 100.0, 60.0), Some(1));
+        // 只有下面那块覆盖到的地方
+        assert_eq!(doc.text_at(0, 55.0, 44.0), Some(0));
+        // 都不在
+        assert_eq!(doc.text_at(0, 300.0, 200.0), None);
+    }
+
+    #[test]
+    fn text_at_ignores_other_output_and_untouched_text() {
+        let mut doc = doc_with_sel(400, 300);
+        push_text(&mut doc, 50.0, 40.0, (100.0, 20.0), "hello");
+        // 查询另一块屏
+        assert_eq!(doc.text_at(1, 60.0, 45.0), None);
+        // 没有选区时也不算命中
+        doc.sel = None;
+        assert_eq!(doc.text_at(0, 60.0, 45.0), None);
+    }
+
+    #[test]
+    fn clear_all_drops_text_frame() {
+        let mut doc = doc_with_sel(400, 300);
+        push_text(&mut doc, 50.0, 40.0, (100.0, 20.0), "hello");
+        doc.text_sel = Some(0);
+        doc.clear_all();
+        assert_eq!(doc.text_sel, None);
+        assert!(doc.text_box(0).is_none());
+    }
 }

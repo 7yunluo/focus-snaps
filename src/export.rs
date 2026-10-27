@@ -232,13 +232,7 @@ mod tests {
             }
         }
         phys.mark_dirty();
-        OutputLayer {
-            size: (lw as f64, lh as f64),
-            sx,
-            sy,
-            phys,
-            windows: Vec::new(),
-        }
+        OutputLayer::new((lw as f64, lh as f64), sx, sy, phys, Vec::new())
     }
 
     #[test]

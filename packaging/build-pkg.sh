@@ -13,5 +13,6 @@ rsync -a packaging/focus-snaps.desktop "$TMP/$NAME/packaging/"
 tar -C "$TMP" -czf "packaging/$NAME.tar.gz" "$NAME"
 rm -rf "$TMP"
 echo "已生成 packaging/$NAME.tar.gz"
+rm -rf packaging/src packaging/pkg
 cd packaging
-makepkg -si --nocheck --noconfirm
+makepkg -si -f --nocheck --noconfirm

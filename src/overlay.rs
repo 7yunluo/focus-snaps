@@ -27,6 +27,7 @@ enum DragKind {
     NewSel,
     Resize(usize),
     Move,
+    MoveText,
     Draw,
 }
 
@@ -37,6 +38,8 @@ struct DragState {
     saved_sel: Option<Selection>,
     saved_strokes: usize,
     saved_number: u32,
+    /// 拖动文字时的原始落点
+    text_from: (f64, f64),
     moved: bool,
 }
 
@@ -48,6 +51,7 @@ impl Default for DragState {
             saved_sel: None,
             saved_strokes: 0,
             saved_number: 1,
+            text_from: (0.0, 0.0),
             moved: false,
         }
     }
@@ -183,13 +187,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         }
         let size = (f64::from(geo.width()), f64::from(geo.height()));
         let win_rects = crate::windows::detect_for_output(&connector, &mut phys, sx, sy, size);
-        outs.push(OutputLayer {
-            size,
-            sx,
-            sy,
-            phys,
-            windows: win_rects,
-        });
+        outs.push(OutputLayer::new(size, sx, sy, phys, win_rects));
         picks.push(m);
     }
 
@@ -247,6 +245,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
                         points: vec![(rect.0 + 20.0, rect.1 + 20.0), (rect.0 + 160.0, rect.1 + 120.0)],
                         text: None,
                         number: None,
+                        text_size: None,
                     });
                     s.doc.borrow_mut().commit(Stroke {
                         tool: Tool::Number,
@@ -255,19 +254,49 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
                         points: vec![(rect.0 + 60.0, rect.1 + 60.0)],
                         text: None,
                         number: Some(7),
+                        text_size: None,
                     });
-                    s.doc.borrow_mut().commit(Stroke {
-                        tool: Tool::Text,
-                        color,
-                        width,
-                        points: vec![(rect.0 + 30.0, rect.1 + 150.0)],
-                        text: Some("玲珑测试 文字".into()),
-                        number: None,
-                    });
+                    let sample = "玲珑测试 文字";
+                    let size = s.measure_text(idx, sample, crate::paint::text_px(width));
+                    {
+                        let mut d = s.doc.borrow_mut();
+                        d.commit(Stroke {
+                            tool: Tool::Text,
+                            color,
+                            width,
+                            points: vec![(rect.0 + 30.0, rect.1 + 150.0)],
+                            text: Some(sample.into()),
+                            number: None,
+                            text_size: size,
+                        });
+                        // 让文字框出现在截图里
+                        d.text_sel = Some(d.strokes.len() - 1);
+                    }
                 }
             }
             s.sync_ui();
             s.redraw();
+            // 模拟在 "x,y,文本[,线宽]" 处打开文字输入并已打上内容
+            if let Ok(spec) = std::env::var("FOCUSSNAPS_TEST_TEXT") {
+                let parts: Vec<&str> = spec.splitn(4, ',').collect();
+                if parts.len() >= 3 {
+                    if let (Ok(x), Ok(y)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
+                        let idx = s.doc.borrow().sel.map(|s| s.out).unwrap_or(0);
+                        if let Some(w) = s.win_of(idx).cloned() {
+                            let at = put_entry(&w, x, y);
+                            s.text_at = Some((idx, at.0, at.1));
+                            // 给了线宽就走真实的大小调节路径
+                            if let Some(v) = parts.get(3).and_then(|v| v.trim().parse::<f64>().ok())
+                            {
+                                w.ui.width_spin.set_value(v);
+                            }
+                            let mut pos = -1i32;
+                            w.ui.entry.insert_text(parts[2], &mut pos);
+                            w.ui.entry.grab_focus();
+                        }
+                    }
+                }
+            }
             if std::env::var("FOCUSSNAPS_TEST_PALETTE").is_ok() {
                 // 自动化检查调色板：连开两次，两次摆放位置应当一致
                 let out = s.doc.borrow().sel.map(|x| x.out);
@@ -368,12 +397,21 @@ fn make_window(
     // 绘制
     {
         let sess = sess.clone();
+        let entry = ui.entry.clone();
         area.set_draw_func(move |_a, cr, w, h| {
             let Ok(s) = sess.try_borrow() else { return };
             let Ok(mut doc) = s.doc.try_borrow_mut() else {
                 return;
             };
-            paint::paint(cr, &mut doc, idx, (f64::from(w), f64::from(h)));
+            // 正在输入的文字直接取输入框内容，边打字边预览
+            let preview = match s.text_at {
+                Some((o, x, y)) if o == idx => Some((x, y, entry.text().to_string())),
+                _ => None,
+            };
+            let preview = preview
+                .as_ref()
+                .map(|(x, y, t)| (*x, *y, t.as_str()));
+            paint::paint(cr, &mut doc, idx, (f64::from(w), f64::from(h)), preview);
         });
     }
 
@@ -460,32 +498,35 @@ fn make_window(
         area.add_controller(right);
     }
 
-    // 文字输入提交
+    // 滚轮：原地调整文字字号
     {
         let sess = sess.clone();
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        scroll.connect_scroll(move |_, _dx, dy| {
+            let mut s = sess.borrow_mut();
+            if s.text_at.is_none() {
+                return glib::Propagation::Proceed;
+            }
+            let step = if dy < 0.0 { 1.0 } else { -1.0 };
+            let next = (s.doc.borrow().width + step).clamp(1.0, 24.0);
+            let spin = s.win_of(idx).map(|w| w.ui.width_spin.clone());
+            if let Some(spin) = spin {
+                spin.set_value(next);
+            }
+            s.redraw();
+            glib::Propagation::Stop
+        });
+        area.add_controller(scroll);
+    }
+
+    // 文字输入：边打字边在画面上预览
+    {
         let entry = ui.entry.clone();
         entry.connect_activate({
             let sess = sess.clone();
-            move |e| {
-                let text = e.text().to_string();
-                e.set_visible(false);
+            move |_| {
                 let mut s = sess.borrow_mut();
-                if let Some((_out, x, y)) = s.text_at.take() {
-                    if !text.is_empty() {
-                        let (color, width) = {
-                            let d = s.doc.borrow();
-                            (d.color, d.width)
-                        };
-                        s.doc.borrow_mut().commit(Stroke {
-                            tool: Tool::Text,
-                            color,
-                            width,
-                            points: vec![(x, y)],
-                            text: Some(text),
-                            number: None,
-                        });
-                    }
-                }
+                s.commit_text();
                 s.redraw();
             }
         });
@@ -496,7 +537,10 @@ fn make_window(
             move |_, key, _, _| {
                 if key == gdk::Key::Escape {
                     entry.set_visible(false);
-                    sess.borrow_mut().text_at = None;
+                    let mut s = sess.borrow_mut();
+                    s.text_at = None;
+                    s.doc.borrow_mut().active = None;
+                    s.redraw();
                     glib::Propagation::Stop
                 } else {
                     glib::Propagation::Proceed
@@ -630,6 +674,40 @@ impl Session {
         }
     }
 
+    /// 结束文字输入，把输入框里的内容提交成一笔标注
+    fn commit_text(&mut self) {
+        let Some((out, x, y)) = self.text_at.take() else {
+            return;
+        };
+        let text = match self.win_of(out) {
+            Some(w) => {
+                w.ui.entry.set_visible(false);
+                w.ui.entry.text().to_string()
+            }
+            None => return,
+        };
+        let (color, width) = {
+            let d = self.doc.borrow();
+            (d.color, d.width)
+        };
+        let size = self.measure_text(out, &text, crate::paint::text_px(width));
+        let mut d = self.doc.borrow_mut();
+        if text.is_empty() {
+            d.text_sel = None;
+        } else {
+            d.commit(Stroke {
+                tool: Tool::Text,
+                color,
+                width,
+                points: vec![(x, y)],
+                text: Some(text),
+                number: None,
+                text_size: size,
+            });
+            d.text_sel = Some(d.strokes.len() - 1);
+        }
+    }
+
     /// 收起文字输入框
     fn cancel_text(&mut self) {
         if self.text_at.take().is_some() {
@@ -637,6 +715,12 @@ impl Session {
                 w.ui.entry.set_visible(false);
             }
         }
+    }
+
+    /// 量一段文字的排版尺寸，用该屏的画面建上下文
+    fn measure_text(&self, out: usize, text: &str, px: f64) -> Option<(f64, f64)> {
+        let surface = self.doc.borrow().outs.get(out).map(|o| o.phys.clone())?;
+        crate::paint::text_size(&surface, text, px)
     }
 
     /// 收起调色板
@@ -739,6 +823,20 @@ fn list_monitors(display: &gdk::Display) -> Vec<gdk::Monitor> {
     out
 }
 
+/// 把文字输入框就地摆到落点上，返回实际用的落点
+fn put_entry(w: &Win, x: f64, y: f64) -> (f64, f64) {
+    let area_w = f64::from(w.area.width());
+    let area_h = f64::from(w.area.height());
+    // 贴边时往回收，别把输入框挤出屏
+    let ax = x.clamp(0.0, (area_w - 40.0).max(0.0));
+    let ay = y.clamp(0.0, (area_h - 30.0).max(0.0));
+    w.ui.entry.set_text("");
+    w.ui.entry.set_margin_start(ax.round() as i32);
+    w.ui.entry.set_margin_top(ay.round() as i32);
+    w.ui.entry.set_visible(true);
+    (ax, ay)
+}
+
 /// 解析 "x,y,w,h"
 fn parse_rect(spec: &str) -> Option<(f64, f64, f64, f64)> {
     let v: Vec<f64> = spec
@@ -776,6 +874,7 @@ fn handle_at(r: (f64, f64, f64, f64), x: f64, y: f64) -> Option<usize> {
 
 fn on_drag_begin(s: &mut Session, idx: usize, x: f64, y: f64) {
     s.close_palette();
+    s.commit_text();
     let (tool, sel, out_size) = {
         let d = s.doc.borrow();
         (
@@ -790,10 +889,25 @@ fn on_drag_begin(s: &mut Session, idx: usize, x: f64, y: f64) {
         saved_sel: sel,
         saved_strokes: s.doc.borrow().strokes.len(),
         saved_number: s.doc.borrow().next_number,
+        text_from: (0.0, 0.0),
         moved: false,
     };
 
     let cur = sel.filter(|s| s.out == idx).map(|s| s.normalized());
+
+    // 点在文字框上：选中它并拖动
+    if tool == Tool::Select {
+        let hit = s.doc.borrow().text_at(idx, x, y);
+        if let Some(i) = hit {
+            let from = s.doc.borrow().strokes[i].points[0];
+            s.doc.borrow_mut().text_sel = Some(i);
+            s.drag.kind = DragKind::MoveText;
+            s.drag.text_from = from;
+            return;
+        }
+        // 没点中文字就把文字框收掉
+        s.doc.borrow_mut().text_sel = None;
+    }
 
     match tool {
         // 单击放置的标注交给单击手势处理
@@ -845,6 +959,7 @@ fn on_drag_begin(s: &mut Session, idx: usize, x: f64, y: f64) {
                     points: vec![(x, y)],
                     text: None,
                     number: None,
+                    text_size: None,
                 });
             } else {
                 s.drag.kind = DragKind::NewSel;
@@ -895,6 +1010,27 @@ fn on_drag_update(s: &mut Session, idx: usize, x: f64, y: f64) {
                 x1: nx0 + rw,
                 y1: ny0 + rh,
             });
+        }
+        DragKind::MoveText => {
+            let Some(i) = s.doc.borrow().text_sel else { return };
+            let (dx, dy) = (x - s.drag.anchor.0, y - s.drag.anchor.1);
+            let (fx, fy) = s.drag.text_from;
+            // 文字框整体留在本屏内
+            let (bw, bh) = s
+                .doc
+                .borrow()
+                .strokes
+                .get(i)
+                .and_then(|st| st.text_size)
+                .unwrap_or((0.0, 0.0));
+            let nx = (fx + dx).clamp(0.0, (w - bw).max(0.0));
+            let ny = (fy + dy).clamp(0.0, (h - bh).max(0.0));
+            let mut d = s.doc.borrow_mut();
+            if let Some(st) = d.strokes.get_mut(i) {
+                if let Some(p) = st.points.first_mut() {
+                    *p = (nx, ny);
+                }
+            }
         }
         DragKind::Resize(handle) => {
             let Some(orig) = s.drag.saved_sel else { return };
@@ -1009,7 +1145,7 @@ fn on_drag_end(s: &mut Session, idx: usize, x: f64, y: f64) {
                 }
             }
         }
-        DragKind::Move => {}
+        DragKind::Move | DragKind::MoveText => {}
         DragKind::Draw => {
             let mut d = s.doc.borrow_mut();
             if let Some(mut a) = d.active.take() {
@@ -1101,6 +1237,7 @@ fn on_click(s: &mut Session, idx: usize, x: f64, y: f64) {
     }
     match tool {
         Tool::Number => {
+            s.doc.borrow_mut().text_sel = None;
             let n = {
                 let mut d = s.doc.borrow_mut();
                 let n = d.next_number;
@@ -1114,24 +1251,19 @@ fn on_click(s: &mut Session, idx: usize, x: f64, y: f64) {
                 points: vec![(x, y)],
                 text: None,
                 number: Some(n),
+                text_size: None,
             });
         }
         Tool::Text => {
             let win = s.win_of(idx).cloned();
-            s.text_at = Some((idx, x, y));
+            {
+                let mut d = s.doc.borrow_mut();
+                d.active = None;
+                d.text_sel = None;
+            }
             if let Some(w) = win {
-                let area_w = f64::from(w.area.width());
-                let area_h = f64::from(w.area.height());
-                let ex = if x + 220.0 > area_w {
-                    (x - 220.0).max(4.0)
-                } else {
-                    x
-                };
-                let ey = if y + 34.0 > area_h { (y - 34.0).max(4.0) } else { y };
-                w.ui.entry.set_text("");
-                w.ui.entry.set_margin_start(ex.round() as i32);
-                w.ui.entry.set_margin_top(ey.round() as i32);
-                w.ui.entry.set_visible(true);
+                let at = put_entry(&w, x, y);
+                s.text_at = Some((idx, at.0, at.1));
                 w.window.present();
                 w.ui.entry.grab_focus();
             }
@@ -1260,7 +1392,10 @@ fn on_key(s: &mut Session, idx: usize, key: gdk::Key, mods: gdk::ModifierType) -
                 if let Some(tool) = Tool::ALL.iter().find(|t| t.shortcut() == lower) {
                     s.cancel_text();
                     s.close_palette();
-                    s.doc.borrow_mut().tool = *tool;
+                    let mut d = s.doc.borrow_mut();
+                    d.tool = *tool;
+                    d.text_sel = None;
+                    drop(d);
                     s.sync_ui();
                     s.redraw();
                     return glib::Propagation::Stop;

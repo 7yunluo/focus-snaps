@@ -13,7 +13,13 @@ pub const HANDLE: f64 = 7.0;
 pub const HANDLE_HIT: f64 = 9.0;
 
 /// 画一个显示器的整块浮层，area 是窗口的实际逻辑尺寸
-pub fn paint(cr: &cairo::Context, doc: &mut Doc, out_idx: usize, area: (f64, f64)) {
+pub fn paint(
+    cr: &cairo::Context,
+    doc: &mut Doc,
+    out_idx: usize,
+    area: (f64, f64),
+    preview: Option<(f64, f64, &str)>,
+) {
     let Doc {
         outs,
         sel,
@@ -21,18 +27,17 @@ pub fn paint(cr: &cairo::Context, doc: &mut Doc, out_idx: usize, area: (f64, f64
         active,
         tool,
         hover,
+        text_sel,
+        width,
         ..
     } = doc;
     let Some(out) = outs.get_mut(out_idx) else {
         return;
     };
 
-    // 画面按物理像素 1:1 采样，避免二次缩放发虚
-    let _ = cr.save();
-    cr.scale(1.0 / out.sx, 1.0 / out.sy);
-    let _ = cr.set_source_surface(&out.phys, 0.0, 0.0);
+    // 贴预先缩到逻辑尺寸的画面，避免每帧重采样
+    let _ = cr.set_source_surface(&out.shown, 0.0, 0.0);
     let _ = cr.paint();
-    let _ = cr.restore();
 
     let sel = sel
         .filter(|s| s.out == out_idx)
@@ -80,10 +85,22 @@ pub fn paint(cr: &cairo::Context, doc: &mut Doc, out_idx: usize, area: (f64, f64
     if let Some(a) = active.as_ref() {
         draw_stroke(cr, out, a);
     }
+    // 正在输入的文字由输入框原地显示，这里只框出它的范围
+    if let Some((px, py, text)) = preview {
+        if !text.is_empty() {
+            let layout = text_layout(cr, text, text_px(*width), true);
+            let (tw, th) = layout.pixel_size();
+            draw_sel_frame(
+                cr,
+                (px, py, px + f64::from(tw), py + f64::from(th)),
+            );
+        }
+    }
     let _ = cr.restore();
 
     draw_frame(cr, (x0, y0, x1, y1), *tool == Tool::Select);
     draw_badge(cr, out, (x0, y0, x1, y1));
+    draw_text_frame(cr, strokes, *text_sel);
 }
 
 fn quad(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64) {
@@ -98,6 +115,28 @@ fn draw_hover(cr: &cairo::Context, r: &crate::windows::Rect) {
     cr.set_source_rgba(1.0, 0.72, 0.55, 0.95);
     cr.set_line_width(2.0);
     cr.rectangle(r.x0, r.y0, r.width(), r.height());
+    let _ = cr.stroke();
+    let _ = cr.restore();
+}
+
+/// 被选中 / 正在输入的文字外面的虚线框
+fn draw_text_frame(cr: &cairo::Context, strokes: &[Stroke], text_sel: Option<usize>) {
+    let Some(s) = text_sel.and_then(|i| strokes.get(i)) else {
+        return;
+    };
+    let (Some((w, h)), Some(&(x, y))) = (s.text_size, s.points.first()) else {
+        return;
+    };
+    draw_sel_frame(cr, (x, y, x + w, y + h));
+}
+
+fn draw_sel_frame(cr: &cairo::Context, r: (f64, f64, f64, f64)) {
+    let (x0, y0, x1, y1) = r;
+    let _ = cr.save();
+    cr.set_source_rgba(1.0, 0.72, 0.55, 0.9);
+    cr.set_line_width(1.0);
+    cr.set_dash(&[4.0, 3.0], 0.0);
+    cr.rectangle(x0 - 3.0, y0 - 3.0, x1 - x0 + 6.0, y1 - y0 + 6.0);
     let _ = cr.stroke();
     let _ = cr.restore();
 }
@@ -189,11 +228,44 @@ fn rounded_rect(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
 /// 建一个指定字号的文字布局
 fn text_layout(cr: &cairo::Context, text: &str, px: f64, bold: bool) -> pango::Layout {
     let layout = create_layout(cr);
-    let mut desc = pango::FontDescription::from_string(if bold { "Sans Bold" } else { "Sans" });
+    let mut desc = pango::FontDescription::new();
+    desc.set_family(&system_font_family());
+    if bold {
+        desc.set_weight(pango::Weight::Bold);
+    }
     desc.set_absolute_size(px * f64::from(pango::SCALE));
     layout.set_font_description(Some(&desc));
     layout.set_text(text);
     layout
+}
+
+/// 系统界面字体的家族名，取不到就用 Sans
+pub fn system_font_family() -> String {
+    if !gtk::is_initialized() {
+        return "Sans".into();
+    }
+    gtk::Settings::default()
+        .and_then(|s| s.gtk_font_name())
+        .map(|n| n.to_string())
+        .map(|n| match n.rsplit_once(' ') {
+            // "Adwaita Sans 11" 末尾是字号，去掉它只留家族名
+            Some((family, size)) if size.chars().all(|c| c.is_ascii_digit()) => family.to_string(),
+            _ => n,
+        })
+        .unwrap_or_else(|| "Sans".into())
+}
+
+/// 文字工具的字号：跟着线宽走
+pub fn text_px(width: f64) -> f64 {
+    (width * 5.0).max(13.0)
+}
+
+/// 量一段文字的排版尺寸（逻辑像素）
+pub fn text_size(surface: &cairo::ImageSurface, text: &str, px: f64) -> Option<(f64, f64)> {
+    let cr = cairo::Context::new(surface).ok()?;
+    let layout = text_layout(&cr, text, px, true);
+    let (w, h) = layout.pixel_size();
+    Some((f64::from(w), f64::from(h)))
 }
 
 /// 画一笔标注
@@ -298,13 +370,10 @@ pub fn draw_stroke(cr: &cairo::Context, out: &mut OutputLayer, s: &Stroke) {
         }
         Tool::Text => {
             if let Some(text) = s.text.as_ref() {
-                let px = (s.width * 5.0).max(13.0);
-                let layout = text_layout(cr, text, px, true);
-                let (_, th) = layout.pixel_size();
+                let layout = text_layout(cr, text, text_px(s.width), true);
                 let _ = cr.save();
                 cr.set_source_rgba(r, g, b, 1.0);
                 cr.move_to(s.points[0].0, s.points[0].1);
-                cr.rel_move_to(0.0, th as f64 * 0.15);
                 show_layout(cr, &layout);
                 let _ = cr.restore();
             }
@@ -422,13 +491,13 @@ mod tests {
         }
         phys.mark_dirty();
         Doc::new(
-            vec![OutputLayer {
-                size: (lw as f64, lh as f64),
+            vec![OutputLayer::new(
+                (lw as f64, lh as f64),
                 sx,
-                sy: sx,
+                sx,
                 phys,
-                windows: Vec::new(),
-            }],
+                Vec::new(),
+            )],
             "/tmp".into(),
         )
     }
@@ -437,7 +506,7 @@ mod tests {
         let mut target = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).unwrap();
         {
             let cr = cairo::Context::new(&target).unwrap();
-            paint(&cr, doc, 0, (w as f64, h as f64));
+            paint(&cr, doc, 0, (w as f64, h as f64), None);
             let _ = cr.show_page();
         }
         let mut data = vec![0u8; (w * h * 4) as usize];
@@ -512,3 +581,4 @@ mod tests {
         assert!(gray(&data, w, 200, 100) >= 195, "反向选区内部 {}", gray(&data, w, 200, 100));
     }
 }
+
