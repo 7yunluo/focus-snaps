@@ -268,6 +268,14 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
             }
             s.sync_ui();
             s.redraw();
+            if std::env::var("FOCUSSNAPS_TEST_PALETTE").is_ok() {
+                // 自动化检查调色板外观
+                let out = s.doc.borrow().sel.map(|x| x.out);
+                if let Some(w) = out.and_then(|i| s.win_of(i)) {
+                    let area = (f64::from(w.area.width()), f64::from(w.area.height()));
+                    w.ui.toggle_palette(area);
+                }
+            }
             if let Ok(path) = std::env::var("FOCUSSNAPS_TEST_SAVE") {
                 let sess2 = sess.clone();
                 glib::timeout_add_local_once(
@@ -336,12 +344,15 @@ fn make_window(
     };
     let ui = Ui::build(&sess.borrow().doc, &area, &actions);
     overlay.add_overlay(&ui.root);
+    overlay.add_overlay(&ui.palette);
     overlay.add_overlay(&ui.entry);
     overlay.add_overlay(&ui.hint);
     // 覆盖层不参与窗口尺寸计算，超出部分裁掉
     overlay.set_measure_overlay(&ui.root, false);
+    overlay.set_measure_overlay(&ui.palette, false);
     overlay.set_measure_overlay(&ui.entry, false);
     overlay.set_clip_overlay(&ui.root, true);
+    overlay.set_clip_overlay(&ui.palette, true);
     overlay.set_clip_overlay(&ui.entry, true);
     window.set_child(Some(&overlay));
 
@@ -578,6 +589,7 @@ impl Session {
                 w.ui.hint.set_visible(false);
             } else {
                 w.ui.root.set_visible(false);
+                w.ui.palette.set_visible(false);
                 w.ui.hint.set_visible(sel.is_none());
             }
             let cursor = match tool {
@@ -615,6 +627,13 @@ impl Session {
             for w in &self.wins {
                 w.ui.entry.set_visible(false);
             }
+        }
+    }
+
+    /// 收起调色板
+    fn close_palette(&self) {
+        for w in &self.wins {
+            w.ui.palette.set_visible(false);
         }
     }
 
@@ -747,6 +766,7 @@ fn handle_at(r: (f64, f64, f64, f64), x: f64, y: f64) -> Option<usize> {
 }
 
 fn on_drag_begin(s: &mut Session, idx: usize, x: f64, y: f64) {
+    s.close_palette();
     let (tool, sel, out_size) = {
         let d = s.doc.borrow();
         (
@@ -1230,6 +1250,7 @@ fn on_key(s: &mut Session, idx: usize, key: gdk::Key, mods: gdk::ModifierType) -
                 let lower = ch.to_ascii_lowercase();
                 if let Some(tool) = Tool::ALL.iter().find(|t| t.shortcut() == lower) {
                     s.cancel_text();
+                    s.close_palette();
                     s.doc.borrow_mut().tool = *tool;
                     s.sync_ui();
                     s.redraw();

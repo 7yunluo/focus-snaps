@@ -2,10 +2,12 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use gtk::cairo;
 use gtk::gdk;
 use gtk::prelude::*;
 
-use crate::doc::{Doc, Tool};
+use crate::doc::{Doc, Tool, DEFAULT_COLOR};
+use crate::icons;
 
 pub type Shared = Rc<RefCell<Doc>>;
 
@@ -16,25 +18,56 @@ pub struct Actions {
     pub on_cancel: Rc<dyn Fn()>,
 }
 
-const COLORS: [((f64, f64, f64), &str); 6] = [
-    ((1.0, 0.32, 0.28), "#ff5247"),
-    ((1.0, 0.78, 0.2), "#ffc733"),
-    ((0.35, 0.85, 0.42), "#59d96b"),
-    ((0.32, 0.66, 1.0), "#52a8ff"),
+/// 调色板每行的色块数
+const PALETTE_COLS: usize = 8;
+
+/// 调色板颜色
+const PALETTE: [((f64, f64, f64), &str); 24] = [
     ((1.0, 1.0, 1.0), "#ffffff"),
+    ((0.78, 0.78, 0.78), "#c8c8c8"),
+    ((0.5, 0.5, 0.5), "#808080"),
     ((0.12, 0.12, 0.12), "#1f1f1f"),
+    ((1.0, 0.32, 0.28), "#ff5247"),
+    ((1.0, 0.54, 0.24), "#ff8a3d"),
+    ((1.0, 0.78, 0.2), "#ffc733"),
+    ((1.0, 0.91, 0.3), "#ffe94d"),
+    ((0.71, 0.91, 0.29), "#b6e84a"),
+    ((0.35, 0.85, 0.42), "#59d96b"),
+    ((0.18, 0.75, 0.61), "#2fbf9b"),
+    ((0.21, 0.79, 0.84), "#35c9d6"),
+    ((0.32, 0.66, 1.0), "#52a8ff"),
+    ((0.24, 0.42, 1.0), "#3d6bff"),
+    ((0.42, 0.36, 1.0), "#6b5bff"),
+    ((0.64, 0.36, 1.0), "#a35bff"),
+    ((1.0, 0.36, 0.69), "#ff5bb0"),
+    ((1.0, 0.3, 0.55), "#ff4d8d"),
+    ((1.0, 0.48, 0.56), "#ff7a90"),
+    ((0.66, 0.44, 0.29), "#a9714b"),
+    ((0.88, 0.79, 0.65), "#e0c9a6"),
+    ((0.66, 0.9, 0.81), "#a8e6cf"),
+    ((0.82, 0.91, 1.0), "#d0e8ff"),
+    ((1.0, 0.85, 0.75), "#ffd9c0"),
 ];
 
 pub struct Ui {
     pub root: gtk::Box,
     /// 手工拖动后的位置（逻辑坐标），None 表示跟着选区自动摆位
-    manual: Rc<std::cell::Cell<Option<(f64, f64)>>>,
+    manual: Rc<Cell<Option<(f64, f64)>>>,
     pub entry: gtk::Entry,
     pub hint: gtk::Label,
+    /// 调色板
+    pub palette: gtk::Box,
+    /// 当前颜色的圆点
+    dot: gtk::DrawingArea,
+    /// 当前颜色
+    color: Rc<Cell<(f64, f64, f64)>>,
+    /// 调色板里的色块按钮与各自的颜色
+    swatches: Rc<RefCell<Vec<(gtk::Button, (f64, f64, f64))>>>,
     tool_buttons: Vec<gtk::ToggleButton>,
-    color_buttons: Vec<gtk::Button>,
     /// 缓存的自然尺寸，避免每次拖动都重新 measure
-    natural: std::cell::Cell<Option<(f64, f64)>>,
+    natural: Cell<Option<(f64, f64)>>,
+    /// 工具条高度，调色板靠它定位
+    bar_h: Rc<Cell<f64>>,
 }
 
 impl Ui {
@@ -44,6 +77,64 @@ impl Ui {
         root.set_halign(gtk::Align::Start);
         root.set_valign(gtk::Align::Start);
         root.set_visible(false);
+
+        // 当前颜色与调色板
+        let color: Rc<Cell<(f64, f64, f64)>> = Rc::new(Cell::new(DEFAULT_COLOR));
+        let dot = gtk::DrawingArea::new();
+        dot.set_content_width(14);
+        dot.set_content_height(14);
+        {
+            let color = color.clone();
+            dot.set_draw_func(move |_d, cr, w, h| draw_dot(cr, w, h, color.get()));
+        }
+        // 工具条高度，place() 量到后写进来
+        let bar_h: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+        let palette = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        palette.add_css_class("fs-palette");
+        palette.set_halign(gtk::Align::Start);
+        palette.set_valign(gtk::Align::Start);
+        palette.set_visible(false);
+        let swatches: Rc<RefCell<Vec<(gtk::Button, (f64, f64, f64))>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        for row in PALETTE.chunks(PALETTE_COLS) {
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+            for (rgba, hex) in row {
+                let btn = gtk::Button::new();
+                btn.add_css_class("fs-swatch");
+                btn.set_focusable(false);
+                btn.set_can_focus(false);
+                btn.set_tooltip_text(Some(hex));
+                let da = gtk::DrawingArea::new();
+                da.set_content_width(13);
+                da.set_content_height(13);
+                let c = *rgba;
+                da.set_draw_func(move |_d, cr, w, h| draw_dot(cr, w, h, c));
+                btn.set_child(Some(&da));
+                {
+                    let doc = doc.clone();
+                    let color = color.clone();
+                    let dot = dot.clone();
+                    let swatches = swatches.clone();
+                    let palette = palette.clone();
+                    btn.connect_clicked(move |_| {
+                        doc.borrow_mut().color = c;
+                        color.set(c);
+                        dot.queue_draw();
+                        for (b, sc) in swatches.borrow().iter() {
+                            if *sc == c {
+                                b.add_css_class("fs-swatch-on");
+                            } else {
+                                b.remove_css_class("fs-swatch-on");
+                            }
+                        }
+                        palette.set_visible(false);
+                    });
+                }
+                line.append(&btn);
+                swatches.borrow_mut().push((btn, c));
+            }
+            palette.append(&line);
+        }
 
         // 第一行：拖动把手 + 工具
         let row_tools = gtk::Box::new(gtk::Orientation::Horizontal, 2);
@@ -64,7 +155,9 @@ impl Ui {
             drag.connect_drag_begin({
                 let start = start.clone();
                 let root = root.clone();
+                let palette = palette.clone();
                 move |g, _x, _y| {
+                    palette.set_visible(false);
                     start.set(grip_pointer(g).map(|(px, py)| {
                         (
                             px,
@@ -103,11 +196,20 @@ impl Ui {
         let mut tool_buttons = Vec::with_capacity(Tool::ALL.len());
         let mut group: Option<gtk::ToggleButton> = None;
         for tool in Tool::ALL {
-            let btn = gtk::ToggleButton::with_label(tool.label());
+            let btn = gtk::ToggleButton::new();
+            btn.add_css_class("fs-tool");
+            let icon = gtk::DrawingArea::new();
+            icon.set_content_width(16);
+            icon.set_content_height(16);
+            icon.set_draw_func(move |_d, cr, w, h| {
+                icons::draw_tool(cr, tool, (f64::from(w), f64::from(h)))
+            });
+            btn.set_child(Some(&icon));
             btn.set_tooltip_text(Some(&format!(
-                "{}（{}）",
-                tool.tip(),
-                tool.shortcut().to_ascii_uppercase()
+                "{}（{}）\n{}",
+                tool.label(),
+                tool.shortcut().to_ascii_uppercase(),
+                tool.tip()
             )));
             btn.set_focusable(false);
             btn.set_can_focus(false);
@@ -136,48 +238,27 @@ impl Ui {
         // 第二行：颜色、线宽、操作
         let row_opts = gtk::Box::new(gtk::Orientation::Horizontal, 3);
         row_opts.add_css_class("fs-row");
-        let mut color_buttons = Vec::with_capacity(COLORS.len());
-        let shared_buttons: Rc<RefCell<Vec<gtk::Button>>> = Rc::new(RefCell::new(Vec::new()));
-        for (rgba, hex) in COLORS {
-            let btn = gtk::Button::new();
-            btn.add_css_class("fs-swatch");
-            btn.set_focusable(false);
-            btn.set_can_focus(false);
-            btn.set_tooltip_text(Some(hex));
-            let da = gtk::DrawingArea::new();
-            da.set_content_width(13);
-            da.set_content_height(13);
-            let (r, g, b) = rgba;
-            da.set_draw_func(move |_d, cr, w, h| {
-                cr.arc(
-                    w as f64 / 2.0,
-                    h as f64 / 2.0,
-                    (w.min(h) as f64) / 2.0 - 0.5,
-                    0.0,
-                    std::f64::consts::TAU,
-                );
-                cr.set_source_rgb(r, g, b);
-                let _ = cr.fill();
+        let color_btn = gtk::Button::new();
+        color_btn.add_css_class("fs-color");
+        color_btn.set_child(Some(&dot));
+        color_btn.set_focusable(false);
+        color_btn.set_can_focus(false);
+        color_btn.set_tooltip_text(Some("颜色"));
+        {
+            let palette = palette.clone();
+            let root = root.clone();
+            let bar_h = bar_h.clone();
+            let area = area.clone();
+            color_btn.connect_clicked(move |_| {
+                toggle_palette(
+                    &palette,
+                    &root,
+                    &bar_h,
+                    (f64::from(area.width()), f64::from(area.height())),
+                )
             });
-            btn.set_child(Some(&da));
-            {
-                let doc = doc.clone();
-                let buttons = shared_buttons.clone();
-                btn.connect_clicked(move |_| {
-                    doc.borrow_mut().color = rgba;
-                    for (b, (c, _)) in buttons.borrow().iter().zip(COLORS.iter()) {
-                        if *c == rgba {
-                            b.add_css_class("fs-swatch-on");
-                        } else {
-                            b.remove_css_class("fs-swatch-on");
-                        }
-                    }
-                });
-            }
-            row_opts.append(&btn);
-            shared_buttons.borrow_mut().push(btn.clone());
-            color_buttons.push(btn);
         }
+        row_opts.append(&color_btn);
 
         row_opts.append(&gtk::Separator::new(gtk::Orientation::Vertical));
         let spin = gtk::SpinButton::with_range(1.0, 24.0, 1.0);
@@ -270,9 +351,13 @@ impl Ui {
             manual,
             entry,
             hint,
+            palette,
+            dot,
+            color,
+            swatches,
             tool_buttons,
-            color_buttons,
-            natural: std::cell::Cell::new(None),
+            natural: Cell::new(None),
+            bar_h,
         }
     }
 
@@ -298,6 +383,9 @@ impl Ui {
             }
             self.root.set_margin_start(nx.round() as i32);
             self.root.set_margin_top(ny.round() as i32);
+            if self.root.height() > 0 {
+                self.bar_h.set(f64::from(self.root.height()));
+            }
             return;
         }
         let (nat_w, nat_h) = match self.natural.get() {
@@ -335,28 +423,80 @@ impl Ui {
                 "PLACE sel={sel:?} area={area:?} nat={nat_w:.0}x{nat_h:.0} -> ({x:.0},{y:.0})"
             );
         }
+        if nat_h > 0.0 {
+            self.bar_h.set(nat_h);
+        }
         self.root.set_margin_start(x.round() as i32);
         self.root.set_margin_top(y.round() as i32);
     }
 
     /// 高亮当前颜色
     pub fn sync_color(&self, color: (f64, f64, f64)) {
-        for (btn, (rgba, _)) in self.color_buttons.iter().zip(COLORS.iter()) {
-            if (rgba.0 - color.0).abs() < 1e-6
-                && (rgba.1 - color.1).abs() < 1e-6
-                && (rgba.2 - color.2).abs() < 1e-6
-            {
+        self.color.set(color);
+        self.dot.queue_draw();
+        for (btn, c) in self.swatches.borrow().iter() {
+            if *c == color {
                 btn.add_css_class("fs-swatch-on");
             } else {
                 btn.remove_css_class("fs-swatch-on");
             }
         }
     }
+    /// 展开或收起调色板
+    pub fn toggle_palette(&self, area: (f64, f64)) {
+        toggle_palette(&self.palette, &self.root, &self.bar_h, area);
+    }
 }
 
 /// 指针在窗口坐标里的位置，控件自身移动不会影响它
 fn grip_pointer(drag: &gtk::GestureDrag) -> Option<(f64, f64)> {
     drag.current_event()?.position()
+}
+
+/// 画一个圆形色块
+fn draw_dot(cr: &cairo::Context, w: i32, h: i32, c: (f64, f64, f64)) {
+    let r = f64::from(w.min(h)) / 2.0 - 0.5;
+    cr.arc(
+        f64::from(w) / 2.0,
+        f64::from(h) / 2.0,
+        r,
+        0.0,
+        std::f64::consts::TAU,
+    );
+    cr.set_source_rgb(c.0, c.1, c.2);
+    let _ = cr.fill();
+}
+
+/// 在工具条下方展开或收起调色板
+fn toggle_palette(palette: &gtk::Box, root: &gtk::Box, bar_h: &Cell<f64>, area: (f64, f64)) {
+    if palette.is_visible() {
+        palette.set_visible(false);
+        return;
+    }
+    palette.set_visible(true);
+    let (pw, ph) = (
+        f64::from(palette.measure(gtk::Orientation::Horizontal, -1).1),
+        f64::from(palette.measure(gtk::Orientation::Vertical, -1).1),
+    );
+    let bar_h = match bar_h.get() {
+        0.0 => f64::from(root.height()),
+        h => h,
+    };
+    let (aw, ah) = area;
+    let top = f64::from(root.margin_top());
+    let x = f64::from(root.margin_start())
+        .min((aw - pw - 6.0).max(4.0))
+        .max(4.0);
+    let y = if top + bar_h + 6.0 + ph <= ah - 6.0 {
+        top + bar_h + 6.0
+    } else {
+        (top - ph - 6.0).max(4.0)
+    };
+    palette.set_margin_start(x.round() as i32);
+    palette.set_margin_top(y.round() as i32);
+    if std::env::var("FOCUSSNAPS_TEST_POINTER").is_ok() {
+        eprintln!("PALETTE {pw:.0}x{ph:.0} bar_h={bar_h:.0} -> ({x:.0},{y:.0})");
+    }
 }
 
 pub fn load_css() {
@@ -389,6 +529,8 @@ pub fn load_css() {
         }
         .fs-bar button.fs-swatch-on { box-shadow: inset 0 0 0 1.5px #ffb68b; }
         .fs-bar button.fs-primary { color: #ffcaa8; }
+        .fs-bar button.fs-tool { min-width: 22px; min-height: 22px; padding: 3px 4px; }
+        .fs-bar button.fs-color { min-width: 22px; min-height: 22px; padding: 4px 6px; }
         .fs-bar separator { background: rgba(255, 255, 255, 0.14); margin: 2px 3px; }
         .fs-bar spinbutton { min-height: 20px; }
         .fs-grip {
@@ -396,6 +538,24 @@ pub fn load_css() {
             padding: 0 3px 0 1px;
             font-size: 13px;
         }
+        .fs-palette {
+            background: rgba(24, 19, 16, 0.94);
+            border-radius: 11px;
+            padding: 7px;
+            border: 1px solid rgba(255, 182, 139, 0.28);
+            box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+        }
+        .fs-palette button {
+            min-width: 19px;
+            min-height: 19px;
+            padding: 3px;
+            background: transparent;
+            border: none;
+            border-radius: 50%;
+            box-shadow: none;
+        }
+        .fs-palette button:hover { background: rgba(255, 182, 139, 0.22); }
+        .fs-palette button.fs-swatch-on { box-shadow: inset 0 0 0 2px #ffb68b; }
         .fs-bar spinbutton text { background: transparent; color: #eee2dc; min-width: 22px; }
         .fs-hint {
             background: rgba(24, 19, 16, 0.82);

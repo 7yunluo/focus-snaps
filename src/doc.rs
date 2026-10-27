@@ -137,6 +137,9 @@ pub struct OutputLayer {
     pub windows: Vec<Rect>,
 }
 
+/// 默认标注颜色
+pub const DEFAULT_COLOR: (f64, f64, f64) = (1.0, 0.32, 0.28);
+
 pub struct Doc {
     pub outs: Vec<OutputLayer>,
     pub sel: Option<Selection>,
@@ -161,7 +164,7 @@ impl Doc {
             strokes: Vec::new(),
             redo: Vec::new(),
             tool: Tool::Select,
-            color: (1.0, 0.45, 0.35),
+            color: DEFAULT_COLOR,
             width: 4.0,
             next_number: 1,
             dir,

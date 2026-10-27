@@ -2,6 +2,7 @@
 mod capture;
 mod doc;
 mod export;
+mod icons;
 mod overlay;
 mod paint;
 mod ui;

@@ -186,6 +186,7 @@ fn rounded_rect(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
     cr.close_path();
 }
 
+/// 建一个指定字号的文字布局
 fn text_layout(cr: &cairo::Context, text: &str, px: f64, bold: bool) -> pango::Layout {
     let layout = create_layout(cr);
     let mut desc = pango::FontDescription::from_string(if bold { "Sans Bold" } else { "Sans" });

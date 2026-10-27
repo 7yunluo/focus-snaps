@@ -50,6 +50,10 @@ cargo install --path . --root ~/.local --force          # 本地安装到 ~/.loc
 
 导出一律走 `export::render_selection` → `save_to_dir` / `save_to_path`（PNG 由 `image` crate 编码）；复制先试 `wl-copy`（不依赖键盘焦点），失败退回 GDK 剪贴板纹理。
 
+## 工具条 UI
+
+`ui.rs` 管工具条、调色板、文字输入框，三者都是 `GtkOverlay` 的独立子控件，位置靠 `set_margin_start/top` 摆；**不要换成 Popover**——浮层是 layer surface，弹窗表面在 layer shell 下不可靠。工具按钮画的是矢量图标（`icons.rs`，纯 cairo，不依赖图标主题）。调色板用 `Ui::bar_h`（`place()` 里量到的工具条高度）定位到工具条下方，别在展开时现取 `root.height()`/`measure()`——那一帧还没分配，量出来的值不可用。
+
 ## 窗口识别
 
 `windows.rs` 的核心不是阈值调参，而是「IPC 先验 + 一维搜索」：
