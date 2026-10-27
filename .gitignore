@@ -3,3 +3,4 @@
 /packaging/pkg
 /packaging/*.tar.gz
 /packaging/*.pkg.tar.zst
+CLAUDE.md
