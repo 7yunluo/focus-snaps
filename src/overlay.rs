@@ -61,6 +61,8 @@ struct Win {
     idx: usize,
     window: gtk::ApplicationWindow,
     area: gtk::DrawingArea,
+    /// 压暗的矩形，洞以外切成上/下/左/右四块，由 CSS 上色
+    dim: [gtk::Box; 4],
     ui: Ui,
     /// 本屏在全局布局里的左上角
     origin: (f64, f64),
@@ -291,6 +293,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
     }
 
     sess.borrow_mut().sync_ui();
+    sess.borrow().sync_dim();
     let color = sess.borrow().doc.borrow().color;
     for w in sess.borrow().wins.clone() {
         w.ui.sync_color(color);
@@ -514,8 +517,23 @@ fn make_window(
     area.set_vexpand(true);
     area.set_cursor_from_name(Some("crosshair"));
 
+    // 压暗交给 4 块 CSS 实心矩形：合成器直接填色块，不占 CPU
+    let dim = std::array::from_fn(|_| gtk::Box::new(gtk::Orientation::Vertical, 0));
+    for d in dim.iter() {
+        d.add_css_class("fs-dim");
+        d.set_can_target(false);
+        d.set_halign(gtk::Align::Start);
+        d.set_valign(gtk::Align::Start);
+        d.set_visible(false);
+    }
+
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&picture));
+    for d in dim.iter() {
+        overlay.add_overlay(d);
+        overlay.set_measure_overlay(d, false);
+        overlay.set_clip_overlay(d, true);
+    }
     overlay.add_overlay(&area);
     overlay.set_measure_overlay(&area, false);
 
@@ -560,7 +578,7 @@ fn make_window(
     {
         let sess = sess.clone();
         let entry = ui.entry.clone();
-        area.set_draw_func(move |_a, cr, w, h| {
+        area.set_draw_func(move |_a, cr, _w, _h| {
             let Ok(s) = sess.try_borrow() else { return };
             let Ok(mut doc) = s.doc.try_borrow_mut() else {
                 return;
@@ -573,7 +591,7 @@ fn make_window(
             let preview = preview
                 .as_ref()
                 .map(|(x, y, t)| (*x, *y, t.as_str()));
-            paint::paint(cr, &mut doc, idx, (f64::from(w), f64::from(h)), preview);
+            paint::paint(cr, &mut doc, idx, preview);
         });
     }
 
@@ -775,6 +793,7 @@ fn make_window(
         idx,
         window,
         area,
+        dim,
         ui,
         origin,
         rect,
@@ -791,8 +810,49 @@ impl Session {
         d.hover.as_ref().map(|r| (r.x0, r.y0, r.x1, r.y1))
     }
 
+    /// 按当前选区（或悬停窗口）摆压暗矩形
+    fn sync_dim(&self) {
+        let (sel, hover) = {
+            let d = self.doc.borrow();
+            (
+                d.sel.map(|s| s.normalized()),
+                d.hover.as_ref().map(|r| (r.x0, r.y0, r.x1, r.y1)),
+            )
+        };
+        for w in &self.wins {
+            let area = (w.rect.2 - w.rect.0, w.rect.3 - w.rect.1);
+            let rects = paint::dim_rects(paint::hole_rect(sel, hover, w.rect), area);
+            for (i, d) in w.dim.iter().enumerate() {
+                let r = rects.get(i).filter(|r| {
+                    (r.2 - r.0).round() > 0.0 && (r.3 - r.1).round() > 0.0
+                });
+                let Some(&(x0, y0, x1, y1)) = r else {
+                    if d.is_visible() {
+                        d.set_visible(false);
+                    }
+                    continue;
+                };
+                let (x, y) = (x0.round() as i32, y0.round() as i32);
+                let (bw, bh) = ((x1 - x0).round() as i32, (y1 - y0).round() as i32);
+                if d.margin_start() != x {
+                    d.set_margin_start(x);
+                }
+                if d.margin_top() != y {
+                    d.set_margin_top(y);
+                }
+                if d.width_request() != bw || d.height_request() != bh {
+                    d.set_size_request(bw, bh);
+                }
+                if !d.is_visible() {
+                    d.set_visible(true);
+                }
+            }
+        }
+    }
+
     /// 重绘：只刷「新旧脏区」碰到的屏，跨屏拖动时相关的那几块一起刷
     fn redraw(&mut self) {
+        self.sync_dim();
         let next = self.dirty_rect();
         let dirty = match (self.dirty, next) {
             (Some(a), Some(b)) => Some(union(a, b)),

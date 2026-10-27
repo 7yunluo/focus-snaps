@@ -540,6 +540,8 @@ fn place_palette(palette: &gtk::Box, root: &gtk::Box, area: (f64, f64)) {
 /// 重新加载样式表（强调色跟随系统主题色）
 /// 样式表；强调色占位符在加载时替换
 const CSS: &str = "
+        /* 选区外压暗：四块实心矩形，由合成器填充 */
+        .fs-dim { background-color: rgba(0, 0, 0, DIM_ALPHA); }
         @define-color fs_accent ACCENT;
         .fs-bar {
             background-color: rgba(24, 19, 16, 0.94);
@@ -631,7 +633,9 @@ thread_local! {
 
 /// 按强调色重新加载样式表
 pub fn set_accent(accent: (f64, f64, f64)) {
-    let css = CSS.replace("ACCENT", &crate::theme::rgb_hex(accent));
+    let css = CSS
+        .replace("ACCENT", &crate::theme::rgb_hex(accent))
+        .replace("DIM_ALPHA", &format!("{}", crate::paint::DIM));
     PROVIDER.with(|cell| {
         let provider = cell.get_or_init(|| {
             let p = gtk::CssProvider::new();
