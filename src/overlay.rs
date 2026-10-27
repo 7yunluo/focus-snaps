@@ -102,8 +102,6 @@ struct Session {
     pending_hover: Option<(f64, f64)>,
     /// 已经排了一帧，别重复排
     pointer_queued: bool,
-    /// 上一次处理指针位置的时刻（FOCUSSNAPS_REDRAW_HZ 用）
-    last_pointer_apply: Option<std::time::Instant>,
 }
 
 /// 等画面就绪后再执行的完成动作
@@ -228,13 +226,14 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
     }
 
     let metas = capture::probe().unwrap_or_default();
+    let logical = crate::niri::outputs_logical().unwrap_or_default();
     trace("probe 完");
     // 先把每块屏的图层按「已知的位置和逻辑尺寸」建出来，不等抓屏。
     // 抓屏走的是合成器把整屏画面读回共享内存，GPU 忙的时候能卡到秒级；
     // 拦在启动路径上就是「按了热键半天没反应」。画面由 apply_capture 后补。
     let mut outs = Vec::new();
     let mut picks: Vec<gdk::Monitor> = Vec::new();
-    let mut targets: Vec<(usize, String, gdk::Rectangle)> = Vec::new();
+    let mut targets: Vec<(usize, String, gdk::Rectangle, (f64, f64))> = Vec::new();
     for m in monitors {
         let Some(connector) = m.connector().map(|s| s.to_string()) else {
             eprintln!("跳过无法识别名称的显示器");
@@ -256,8 +255,13 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         }
         // GDK 给的显示器位置就是合成器的全局逻辑布局坐标，跨屏拼接全靠它
         let origin = (f64::from(geo.x()), f64::from(geo.y()));
-        let size = (f64::from(geo.width()), f64::from(geo.height()));
-        targets.push((outs.len(), connector, geo));
+        // 尺寸用合成器自己报的逻辑尺寸：GDK 那边可能是四舍五入过的，
+        // 差一个逻辑像素就会让整块浮层被缩放一次（见 niri::outputs_logical）
+        let size = match logical.iter().find(|(n, _)| n == &connector) {
+            Some((_, (w, h))) => (f64::from(*w), f64::from(*h)),
+            None => (f64::from(geo.width()), f64::from(geo.height())),
+        };
+        targets.push((outs.len(), connector, geo, size));
         outs.push(OutputLayer::pending(origin, size));
         picks.push(m);
     }
@@ -284,7 +288,6 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         pending_drag: None,
         pending_hover: None,
         pointer_queued: false,
-        last_pointer_apply: None,
     }));
 
     for (idx, monitor) in picks.iter().enumerate() {
@@ -616,7 +619,11 @@ fn test_save(sess: SessionRef, path: String, tries: u32) {
 }
 
 /// 后台抓屏：每块屏一个线程，抓回来一块就在主线程补一块画面
-fn start_captures(sess: &SessionRef, targets: Vec<(usize, String, gdk::Rectangle)>, cursor: bool) {
+fn start_captures(
+    sess: &SessionRef,
+    targets: Vec<(usize, String, gdk::Rectangle, (f64, f64))>,
+    cursor: bool,
+) {
     if targets.is_empty() {
         return;
     }
@@ -624,20 +631,21 @@ fn start_captures(sess: &SessionRef, targets: Vec<(usize, String, gdk::Rectangle
         usize,
         String,
         gdk::Rectangle,
+        (f64, f64),
         Result<capture::Capture, String>,
     )>();
-    for (idx, name, geo) in targets {
+    for (idx, name, geo, logical) in targets {
         let tx = tx.clone();
         std::thread::spawn(move || {
             let r = capture::capture_output(&name, cursor);
-            let _ = tx.send((idx, name, geo, r));
+            let _ = tx.send((idx, name, geo, logical, r));
         });
     }
     drop(tx);
     let sess2 = sess.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(20), move || loop {
         match rx.try_recv() {
-            Ok((idx, name, geo, r)) => apply_capture(&sess2, idx, &name, geo, r),
+            Ok((idx, name, geo, logical, r)) => apply_capture(&sess2, idx, &name, geo, logical, r),
             Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => return glib::ControlFlow::Break,
         }
@@ -650,6 +658,7 @@ fn apply_capture(
     idx: usize,
     connector: &str,
     geo: gdk::Rectangle,
+    size: (f64, f64),
     cap: Result<capture::Capture, String>,
 ) {
     let mut cap = match cap {
@@ -693,12 +702,11 @@ fn apply_capture(
             )
         }
     };
-    let sx = cap.width as f64 / geo.width() as f64;
-    let sy = cap.height as f64 / geo.height() as f64;
+    let sx = cap.width as f64 / size.0;
+    let sy = cap.height as f64 / size.1;
     if (sx / sy - 1.0).abs() > 0.02 {
         eprintln!("显示器 {connector} 横纵缩放不一致（{sx:.3} / {sy:.3}），画面可能轻微拉伸");
     }
-    let size = (f64::from(geo.width()), f64::from(geo.height()));
     let origin = (f64::from(geo.x()), f64::from(geo.y()));
     // 零拷贝的画面还要在后台读一份像素出来（导出、打码、窗口识别要用）
     let reader = kept.as_ref().map(|b| b.reader());
@@ -845,19 +853,6 @@ fn schedule_pointer(sess: &SessionRef) {
             return glib::ControlFlow::Break;
         };
         s.pointer_queued = false;
-        // 可选的更新上限：负载高的时候把拖着走的重绘降到几十 Hz 试试
-        let now = std::time::Instant::now();
-        if let Some(hz) = max_redraw_hz() {
-            let min = std::time::Duration::from_secs_f64(1.0 / hz);
-            if let Some(prev) = s.last_pointer_apply {
-                if now.duration_since(prev) < min {
-                    drop(s);
-                    // 余下的位置还在，下个事件会再排；这里直接结束
-                    return glib::ControlFlow::Break;
-                }
-            }
-        }
-        s.last_pointer_apply = Some(now);
         if let Some((i, x, y)) = s.pending_drag.take() {
             on_drag_update(&mut s, i, x, y);
             s.redraw();
@@ -869,14 +864,6 @@ fn schedule_pointer(sess: &SessionRef) {
         }
         glib::ControlFlow::Break
     });
-}
-
-/// 拖拽期间的重绘上限（FOCUSSNAPS_REDRAW_HZ），不设就不限
-fn max_redraw_hz() -> Option<f64> {
-    std::env::var("FOCUSSNAPS_REDRAW_HZ")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| *v > 0.0)
 }
 
 /// 建一个显示器的浮层窗口
@@ -1181,11 +1168,31 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
 
     // --- layer shell 配置 ---
     window.init_layer_shell();
+    // 尺寸对齐到合成器自己报的逻辑尺寸：GDK 的几何可能是四舍五入过的，
+    // 差一个逻辑像素会让整块浮层被缩放一次（DP-1：GDK 3793 → 缓冲 5121，
+    // 而输出是 5120）。对不上就自己定尺寸，只锚左上。
+    let gdk_geo = monitor.geometry();
+    let own_size = {
+        let s = sess.borrow();
+        let doc = s.doc.borrow();
+        doc.outs.get(idx).map(|o| {
+            (
+                o.size.0.round() as i32,
+                o.size.1.round() as i32,
+            )
+        })
+    }
+    .filter(|(w, h)| *w > 0 && *h > 0 && (*w != gdk_geo.width() || *h != gdk_geo.height()));
+    if let Some((w, h)) = own_size {
+        window.set_default_size(w, h);
+    }
     window.set_namespace(Some("focussnaps"));
     window.set_layer(Layer::Overlay);
     window.set_monitor(Some(monitor));
     for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
-        window.set_anchor(edge, true);
+        // 自己定尺寸时只锚左上，否则合成器会按它自己的尺寸把表面拉满
+        let anchor = own_size.is_none() || matches!(edge, Edge::Top | Edge::Left);
+        window.set_anchor(edge, anchor);
     }
     window.set_exclusive_zone(-1);
     window.set_keyboard_mode(KeyboardMode::Exclusive);

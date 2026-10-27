@@ -98,6 +98,22 @@ pub fn active_workspace_windows(output: &str) -> Option<Vec<WinInfo>> {
     Some(out)
 }
 
+/// 每块屏幕的逻辑尺寸（合成器视角）
+///
+/// GDK 报的显示器几何是 round(物理/缩放)，和合成器自己按输出算出来的逻辑尺寸
+/// 可能差一个逻辑像素（DP-1 上 GDK 说 3793，niri 说 3792）。差这一像素，
+/// 我们这块铺满整屏的浮层就会被合成器整屏重采样一次。
+pub fn outputs_logical() -> Option<Vec<(String, (i32, i32))>> {
+    let v = run_json(&["msg", "--json", "outputs"])?;
+    let mut out = Vec::new();
+    for (name, o) in v.as_object()? {
+        let l = &o["logical"];
+        let (w, h) = (l["width"].as_i64()?, l["height"].as_i64()?);
+        out.push((name.clone(), (w as i32, h as i32)));
+    }
+    Some(out)
+}
+
 /// 当前焦点显示器的名字
 pub fn focused_output() -> Option<String> {
     let v = run_json(&["msg", "--json", "focused-output"])?;
