@@ -94,6 +94,16 @@ struct Session {
     exporting: bool,
     /// 画面还没抓回来时按下的完成动作，等最后一块屏补上再执行
     pending: Option<Export>,
+    /// 上一次重绘的时刻，卡顿排查用
+    last_redraw: Option<std::time::Instant>,
+    /// 还没处理的最新指针位置（拖动用），同一个帧里的多个事件合并成一次
+    pending_drag: Option<(usize, f64, f64)>,
+    /// 还没处理的最新悬停位置
+    pending_hover: Option<(f64, f64)>,
+    /// 已经排了一帧，别重复排
+    pointer_queued: bool,
+    /// 上一次处理指针位置的时刻（FOCUSSNAPS_REDRAW_HZ 用）
+    last_pointer_apply: Option<std::time::Instant>,
 }
 
 /// 等画面就绪后再执行的完成动作
@@ -270,6 +280,11 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         last_click: None,
         exporting: false,
         pending: None,
+        last_redraw: None,
+        pending_drag: None,
+        pending_hover: None,
+        pointer_queued: false,
+        last_pointer_apply: None,
     }));
 
     for (idx, monitor) in picks.iter().enumerate() {
@@ -308,6 +323,29 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         w.window.present();
     }
     trace("present 完");
+    if std::env::var_os("FOCUSSNAPS_TRACE").is_some() {
+        // 帧时钟间隔看门狗：连续两次 tick 之间隔太久，是合成器/系统卡的
+        let last = std::cell::Cell::new(None::<std::time::Instant>);
+        if let Some(w) = sess.borrow().wins.first() {
+            let sess3 = sess.clone();
+            w.annot.add_tick_callback(move |_w, _c| {
+                let now = std::time::Instant::now();
+                let dragging = sess3
+                    .try_borrow()
+                    .map(|s| s.drag.kind != DragKind::None)
+                    .unwrap_or(false);
+                if let Some(prev) = last.get() {
+                    let gap = now.duration_since(prev).as_millis();
+                    // 只在拖拽期间报：空闲时没有重绘，帧时钟本来就不跳
+                    if dragging && gap > 40 {
+                        trace(&format!("帧时钟间隔 {gap} ms（合成器没给帧）"));
+                    }
+                }
+                last.set(Some(now));
+                glib::ControlFlow::Continue
+            });
+        }
+    }
     start_captures(&sess, targets, opts.cursor);
     {
         let ticks = std::cell::Cell::new(0u32);
@@ -329,9 +367,16 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         }
     }
 
-    // 性能回归用：连续重绘若干帧，打印实际帧间隔（FOCUSSNAPS_BENCH=帧数）
+    // 性能回归用：连续重绘若干帧，打印实际帧间隔
+    //
+    // FOCUSSNAPS_BENCH=帧数[:drag[:每帧事件数]]
+    //   drag 模式下每帧还会挪一下选区，走真实的拖拽路径；
+    //   每帧事件数模拟高回报率鼠标（1000 Hz 在 120 Hz 屏上约 8 个/帧）
     if let Ok(spec) = std::env::var("FOCUSSNAPS_BENCH") {
-        let frames: u32 = spec.parse().unwrap_or(120);
+        let mut parts = spec.split(':');
+        let frames: u32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(120);
+        let drag = parts.next().map(|m| m.contains("drag")).unwrap_or(false);
+        let steps: u32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(1);
         let sess = sess.clone();
         glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
             let Some(w) = sess.borrow().wins.first().cloned() else {
@@ -341,14 +386,34 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
             let done = std::cell::Cell::new(0u32);
             let quit = sess.clone();
             w.annot.add_tick_callback(move |w, _clock| {
+                if drag {
+                    for _ in 0..steps {
+                        if let Ok(mut s) = quit.try_borrow_mut() {
+                            let bbox = s.doc.borrow().bbox();
+                            let cur = s.doc.borrow().sel;
+                            if let Some(mut sel) = cur {
+                                let step = if (done.get() / 30) % 2 == 0 { 0.5 } else { -0.5 };
+                                sel.x1 = (sel.x1 + step).clamp(sel.x0 + 40.0, bbox.2);
+                                sel.y1 = (sel.y1 + step).clamp(sel.y0 + 40.0, bbox.3);
+                                s.doc.borrow_mut().sel = Some(sel);
+                                s.redraw();
+                            }
+                        }
+                    }
+                }
                 w.queue_draw();
                 let n = done.get() + 1;
                 done.set(n);
                 if n >= frames {
                     let dt = start.elapsed().as_secs_f64();
                     eprintln!(
-                        "BENCH {} 帧，{:.2} ms/帧（{:.0} fps）",
+                        "BENCH {} 帧{}，{:.2} ms/帧（{:.0} fps）",
                         frames,
+                        if drag {
+                            format!("（模拟拖拽，每帧 {steps} 个指针事件）")
+                        } else {
+                            String::new()
+                        },
                         dt * 1000.0 / f64::from(frames),
                         f64::from(frames) / dt
                     );
@@ -665,6 +730,9 @@ fn apply_capture(
         Some(reader) => {
             let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
             std::thread::spawn(move || {
+                // 读显存是一大坨内存操作，降到最低优先级，别跟拖拽抢带宽
+                // SAFETY: 只是把本线程的 nice 值调高
+                unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 19) };
                 let _ = tx.send(reader.read_pixels());
             });
             glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
@@ -741,6 +809,74 @@ fn finish_layer(sess: &SessionRef, idx: usize, connector: &str, pixels: Option<V
             }
         }
     }
+}
+
+impl Session {
+    /// 记下最新的指针位置；拖动和悬停各自只保留最后一个
+    fn queue_pointer(&mut self, idx: usize, gx: f64, gy: f64) {
+        if self.drag.kind != DragKind::None {
+            self.pending_drag = Some((idx, gx, gy));
+        } else {
+            self.pending_hover = Some((gx, gy));
+        }
+    }
+}
+
+/// 排一次「下一帧」来消费最新的指针位置
+///
+/// 一定要挂帧时钟而不是空闲回调：空闲回调在指针密集时一秒能跑上千次，
+/// 等于没合并；帧时钟保证每个屏幕上真正要画的帧最多更新一次。
+fn schedule_pointer(sess: &SessionRef) {
+    let Ok(mut s) = sess.try_borrow_mut() else {
+        return;
+    };
+    if s.pointer_queued {
+        return;
+    }
+    let Some(w) = s.wins.first().cloned() else {
+        return;
+    };
+    s.pointer_queued = true;
+    drop(s);
+    let sess2 = sess.clone();
+    w.screen.add_tick_callback(move |_w, _clock| {
+        let Ok(mut s) = sess2.try_borrow_mut() else {
+            // 借用不到就等下一个事件再排
+            return glib::ControlFlow::Break;
+        };
+        s.pointer_queued = false;
+        // 可选的更新上限：负载高的时候把拖着走的重绘降到几十 Hz 试试
+        let now = std::time::Instant::now();
+        if let Some(hz) = max_redraw_hz() {
+            let min = std::time::Duration::from_secs_f64(1.0 / hz);
+            if let Some(prev) = s.last_pointer_apply {
+                if now.duration_since(prev) < min {
+                    drop(s);
+                    // 余下的位置还在，下个事件会再排；这里直接结束
+                    return glib::ControlFlow::Break;
+                }
+            }
+        }
+        s.last_pointer_apply = Some(now);
+        if let Some((i, x, y)) = s.pending_drag.take() {
+            on_drag_update(&mut s, i, x, y);
+            s.redraw();
+        }
+        if let Some((x, y)) = s.pending_hover.take() {
+            if s.update_hover(x, y) {
+                s.redraw();
+            }
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+/// 拖拽期间的重绘上限（FOCUSSNAPS_REDRAW_HZ），不设就不限
+fn max_redraw_hz() -> Option<f64> {
+    std::env::var("FOCUSSNAPS_REDRAW_HZ")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
 }
 
 /// 建一个显示器的浮层窗口
@@ -881,10 +1017,11 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
         drag.connect_drag_update({
             let sess = sess.clone();
             move |_g, ox, oy| {
-                let mut s = sess.borrow_mut();
-                let anchor = s.drag.anchor;
-                on_drag_update(&mut s, idx, anchor.0 + ox, anchor.1 + oy);
-                s.redraw();
+                // 高回报率鼠标一秒能报上千个位置，同一帧里只处理最新那个：
+                // 每个事件都跑一遍几何计算和 widget 更新纯属浪费
+                let anchor = sess.borrow().drag.anchor;
+                sess.borrow_mut().queue_pointer(idx, anchor.0 + ox, anchor.1 + oy);
+                schedule_pointer(&sess);
             }
         });
         drag.connect_drag_end({
@@ -939,16 +1076,10 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
             }
         });
         motion.connect_motion(move |_c, x, y| {
-            let mut s = sess.borrow_mut();
-            let (gx, gy) = (x + origin.0, y + origin.1);
-            if s.drag.kind != DragKind::None {
-                on_drag_update(&mut s, idx, gx, gy);
-                s.redraw();
-                return;
-            }
-            if s.update_hover(gx, gy) {
-                s.redraw();
-            }
+            // 同样按帧合并：拖动时这个处理器和 gesture 的 drag_update 都会收到
+            // 同一个位置，一个个处理等于干两遍
+            sess.borrow_mut().queue_pointer(idx, x + origin.0, y + origin.1);
+            schedule_pointer(&sess);
         });
         // 调试用：把指针的逻辑坐标打到 stderr
         if std::env::var("FOCUSSNAPS_TEST_POINTER").is_ok() {
@@ -1172,6 +1303,15 @@ impl Session {
 
     /// 重绘：只刷「新旧脏区」碰到的屏，跨屏拖动时相关的那几块一起刷
     fn redraw(&mut self) {
+        let t = std::time::Instant::now();
+        if let Some(prev) = self.last_redraw {
+            let gap = t.duration_since(prev).as_millis();
+            // 拖拽期间两次重绘隔太久，说明卡在等系统（合成器没给帧、被别的进程抢）
+            if gap > 40 && self.drag.kind != DragKind::None {
+                trace(&format!("重绘间隔 {gap} ms（卡在等系统）"));
+            }
+        }
+        self.last_redraw = Some(t);
         self.sync_dim();
         self.sync_annot();
         let next = self.dirty_rect();
@@ -1185,6 +1325,11 @@ impl Session {
             if dirty.map(|d| intersect(d, w.rect).is_some()).unwrap_or(true) {
                 w.annot.queue_draw();
             }
+        }
+        let cost = t.elapsed().as_millis();
+        // 我们自己的这一趟要是一直很慢就是代码问题
+        if cost > 10 {
+            trace(&format!("redraw 本身花了 {cost} ms"));
         }
     }
 
