@@ -12,8 +12,13 @@ pub const HANDLE: f64 = 7.0;
 /// 手柄命中半径（逻辑像素）
 pub const HANDLE_HIT: f64 = 9.0;
 
-/// 标注层的余量（逻辑像素）：手柄、边框伸出去的部分，加上选区上方那块尺寸徽标
-pub const ANNOT_PAD: f64 = 34.0;
+/// 标注层四周的余量（逻辑像素）：手柄和边框伸出去的那点
+pub const ANNOT_PAD: f64 = 10.0;
+/// 上方还要留出尺寸徽标的位置
+///
+/// 标注层每次重画都要把整层当纹理传一遍，层越小每帧申请的内存越少，
+/// 所以除了徽标要的那点高度，其余三边只留手柄伸出去的量。
+pub const ANNOT_PAD_TOP: f64 = 34.0;
 
 /// 标注层需要覆盖的范围（本屏局部坐标）
 ///
@@ -21,10 +26,16 @@ pub const ANNOT_PAD: f64 = 34.0;
 /// 返回 None 表示这屏上什么都不用画，图层可以整个藏起来。
 pub fn annot_rect(live: Option<Rect4>, out_rect: Rect4) -> Option<Rect4> {
     let r = intersect(live?, out_rect)?;
+    // 尺寸徽标放得下就在选区上方，放不下会挪到下方，只有它会伸出去
+    let (pad_top, pad_bottom) = if r.1 - out_rect.1 >= ANNOT_PAD_TOP {
+        (ANNOT_PAD_TOP, ANNOT_PAD)
+    } else {
+        (ANNOT_PAD, ANNOT_PAD_TOP)
+    };
     let x0 = (r.0 - ANNOT_PAD).max(out_rect.0);
-    let y0 = (r.1 - ANNOT_PAD).max(out_rect.1);
+    let y0 = (r.1 - pad_top).max(out_rect.1);
     let x1 = (r.2 + ANNOT_PAD).min(out_rect.2);
-    let y1 = (r.3 + ANNOT_PAD).min(out_rect.3);
+    let y1 = (r.3 + pad_bottom).min(out_rect.3);
     let local = (
         x0 - out_rect.0,
         y0 - out_rect.1,
@@ -646,20 +657,20 @@ mod tests {
     fn annot_rect_pads_live_area_and_clamps_to_screen() {
         let out_rect = (0.0, 0.0, 1000.0, 800.0);
         let pad = ANNOT_PAD;
-        // 屏幕中间的选区：四周各留一点余量
+        // 屏幕中间的选区：上面多留一块放尺寸徽标，其余三边只留手柄的量
         assert_eq!(
             annot_rect(Some((100.0, 100.0, 300.0, 200.0)), out_rect),
-            Some((100.0 - pad, 100.0 - pad, 300.0 + pad, 200.0 + pad))
+            Some((100.0 - pad, 100.0 - ANNOT_PAD_TOP, 300.0 + pad, 200.0 + pad))
         );
-        // 贴边的选区裁在本屏内
+        // 贴边的选区裁在本屏内；上方放不下徽标，所以是下方多留
         assert_eq!(
             annot_rect(Some((0.0, 0.0, 300.0, 200.0)), out_rect),
-            Some((0.0, 0.0, 300.0 + pad, 200.0 + pad))
+            Some((0.0, 0.0, 300.0 + pad, 200.0 + ANNOT_PAD_TOP))
         );
         // 跨屏选区：本屏只取自己那一段
         assert_eq!(
             annot_rect(Some((900.0, 100.0, 1400.0, 200.0)), out_rect),
-            Some((900.0 - pad, 100.0 - pad, 1000.0, 200.0 + pad))
+            Some((900.0 - pad, 100.0 - ANNOT_PAD_TOP, 1000.0, 200.0 + pad))
         );
         // 没有选区也没有悬停窗口，整层可以藏起来
         assert_eq!(annot_rect(None, out_rect), None);

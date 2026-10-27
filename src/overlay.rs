@@ -103,6 +103,8 @@ struct Session {
     pending_hover: Option<(f64, f64)>,
     /// 已经排了一帧，别重复排
     pointer_queued: bool,
+    /// 正在后台读像素的屏（别重复读）
+    pixels_reading: Vec<usize>,
 }
 
 /// 等画面就绪后再执行的完成动作
@@ -170,6 +172,21 @@ fn watch_stalls() {
                         .map(|l| l.split_whitespace().nth(1).unwrap_or("?").to_string())
                 })
                 .unwrap_or_default();
+            // 正在跑（状态 R）时 wchan 是空的，内核栈读不到（权限），
+            // 但能看出它此刻停在哪个系统调用里
+            let syscall = std::fs::read_to_string(format!("/proc/self/task/{tid}/syscall"))
+                .map(|t| t.trim().to_string())
+                .unwrap_or_else(|e| format!("（读不到: {e}）"));
+            let io = std::fs::read_to_string("/proc/self/io")
+                .map(|t| {
+                    t.lines()
+                        .filter(|l| l.starts_with("read_bytes") || l.starts_with("write_bytes"))
+                        .map(|l| l.trim().replace(": ", "="))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            trace(&format!("主线程此刻的系统调用：{syscall}；{io}"));
             trace(&format!(
                 "主线程停住了：状态 {state}，卡在 {wchan}，这 300 ms 用户态 {} ms + 内核态 {} ms，缺页 {} 次（主要 {}），RSS {rss} kB，最后在「{}」",
                 cpu.0.saturating_sub(last_cpu.0) * 10,
@@ -410,6 +427,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         pending_drag: None,
         pending_hover: None,
         pointer_queued: false,
+        pixels_reading: Vec::new(),
     }));
 
     for (idx, monitor) in picks.iter().enumerate() {
@@ -449,6 +467,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
     }
     trace("present 完");
     watch_stalls();
+    start_pixel_broker(&sess);
     if std::env::var_os("FOCUSSNAPS_TRACE").is_some() {
         // 帧时钟间隔看门狗：连续两次 tick 之间隔太久，是合成器/系统卡的
         let last = std::cell::Cell::new(None::<std::time::Instant>);
@@ -731,6 +750,18 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
                     }
                 }
             }
+            // 自动化用：直接切到某个工具（打码要整屏像素，走的路和别的工具不同）
+            if let Ok(name) = std::env::var("FOCUSSNAPS_TEST_TOOL") {
+                let mut s = s;
+                let pick = Tool::ALL
+                    .into_iter()
+                    .find(|t| format!("{t:?}").eq_ignore_ascii_case(&name));
+                if let Some(t) = pick {
+                    let mut d = s.doc.borrow_mut();
+                    d.tool = t;
+                }
+                s.redraw();
+            }
             if let Ok(path) = std::env::var("FOCUSSNAPS_TEST_SAVE") {
                 test_save(sess.clone(), path, 0);
             }
@@ -757,7 +788,22 @@ fn test_save(sess: SessionRef, path: String, tries: u32) {
             test_save(sess2, path, tries + 1);
             return;
         }
-        let s = s;
+        let missing: Vec<usize> = {
+            let d = s.doc.borrow();
+            s.wanted_outputs(&d)
+                .into_iter()
+                .filter(|i| d.outs[*i].phys.is_none())
+                .collect()
+        };
+        if !s.all_ready() || !missing.is_empty() {
+            drop(s);
+            // 这条测试路径没有 pending 帮它触发取像素，自己催一下
+            for i in missing {
+                fetch_pixels(&sess2, i);
+            }
+            test_save(sess2, path, tries + 1);
+            return;
+        }
         let mut doc = s.doc.borrow_mut();
         let saved = crate::export::render_selection(&mut doc)
             .and_then(|mut surf| crate::export::save_to_path(&mut surf, &path));
@@ -823,8 +869,12 @@ fn apply_capture(
     let (width, height) = (cap.width as i32, cap.height as i32);
     // 优先零拷贝：合成器把画面画在显存里，纹理直接引它，
     // 既不用等 GPU 读回，也不用再往显存上传 44 MB。
-    // 这条路像素还没读，后面交给后台线程（见 spawn_pixels）。
-    let (texture, kept, phys) = match cap.dmabuf {
+    //
+    // 第三条是个 `Option<Vec<u8>>`：共享内存那条路像素本来就在手边，要拿去
+    // 识别窗口；零拷贝那条路由后台线程从显存里读（见 spawn_pixels）。
+    // 两条路都**不留下常驻的 CPU 像素**——44 MB 常驻在没有内存压力的机器上
+    // 不算什么，这台机器内存紧张的时候它就是被回收、被换出的那批页。
+    let (texture, kept, pixels) = match cap.dmabuf {
         Some(buf) => match export::dmabuf_texture(&buf) {
             Ok(t) => {
                 trace("走零拷贝（显存缓冲直接当纹理）");
@@ -837,8 +887,8 @@ fn apply_capture(
                 if pixels.is_empty() {
                     return;
                 }
-                let (t, p) = bgra_texture_and_surface(width, height, pixels);
-                (t, None, p)
+                let t = export::texture_from_bgra(&pixels, width, height);
+                (t, None, Some(pixels))
             }
         },
         None => {
@@ -847,8 +897,8 @@ fn apply_capture(
             if pixels.is_empty() {
                 return;
             }
-            let (t, p) = bgra_texture_and_surface(width, height, pixels);
-            (t, None, p)
+            let t = export::texture_from_bgra(&pixels, width, height);
+            (t, None, Some(pixels))
         }
     };
     let sx = cap.width as f64 / size.0;
@@ -859,7 +909,6 @@ fn apply_capture(
     let origin = (f64::from(geo.x()), f64::from(geo.y()));
     // 零拷贝那条路像素还没读：把缓冲的读取权交给后台线程
     let reader = kept.as_ref().map(|b| b.reader());
-    let have_phys = phys.is_some();
     let mut s = sess.borrow_mut();
     {
         let mut d = s.doc.borrow_mut();
@@ -870,7 +919,6 @@ fn apply_capture(
             o.size = size;
             o.texture = Some(texture.clone());
             o.keep = kept;
-            o.phys = phys;
         }
     }
     if let Some(w) = s.win_of(idx).cloned() {
@@ -890,28 +938,17 @@ fn apply_capture(
     // 那一瞬间（纹理下载 70 ms + 识别 20 ms，还只能在主线程做），正好撞上
     // 用户开始拖框，拖动会卡一下、甚至整个按下-拖动被吞掉。
     let args = DetectArgs { sx, sy, origin, size };
-    match reader {
-        Some(reader) => spawn_pixels(sess, idx, connector.to_string(), args, reader),
-        // 像素已经拿去做纹理了，识别只能就地做（一屏一次，20 ms 以内）
-        None => {
-            if have_phys {
-                finish_layer(sess, idx, connector, None, None);
-            }
+    match (reader, pixels) {
+        // 零拷贝：后台线程从显存里读，读完顺手识别
+        (Some(reader), _) => {
+            spawn_pixels(sess, idx, connector.to_string(), args, Some(reader), None)
         }
+        // 共享内存：像素在手上，直接丢给后台线程识别，识完就扔
+        (None, Some(px)) => {
+            spawn_pixels(sess, idx, connector.to_string(), args, None, Some((px, width, height)))
+        }
+        (None, None) => {}
     }
-}
-
-/// 抓屏像素建纹理 + 画布
-///
-/// 纹理接管所有权（上传到显存时零拷贝），画布得另拷一份——两份数据结构各自
-/// 拥有自己的内存，cairo 画布和 GdkTexture 都没有「借别人的字节」的接口。
-fn bgra_texture_and_surface(
-    width: i32,
-    height: i32,
-    pixels: Vec<u8>,
-) -> (gdk::Texture, Option<gtk::cairo::ImageSurface>) {
-    let surface = export::surface_from_bgra(width as u32, height as u32, &pixels).ok();
-    (export::texture_from_bgra_owned(pixels, width, height), surface)
 }
 
 /// 后台线程读像素那一步要的参数
@@ -923,45 +960,165 @@ struct DetectArgs {
     size: (f64, f64),
 }
 
-/// 在后台线程里把显存缓冲读成像素，顺手识别窗口，再回主线程补画布
+/// 后台线程备像素、识别窗口，像素用完就扔
 ///
-/// 显存是 write-combined 映射，读起来慢（44 MB 几百毫秒），但它是纯内存拷贝，
-/// 放在后台线程一点都不影响浮层和拖动——这就是零拷贝抓屏的好处：
-/// 显示根本不需要等像素。
+/// 两个来源：零拷贝时从显存里读（write-combined，44 MB 几百毫秒），
+/// 共享内存时像素本来就在手边。**读出来的像素不留在进程里**——识别完
+/// 窗口就丢掉，导出/打码要像素的时候再按需去纹理上取（见 hurry_one）。
+///
+/// 这台机器内存一紧张，常驻的那 44 MB 就是被回收、被换出的对象，
+/// 省下它就是省下每一次进内核回收的机会。
 fn spawn_pixels(
     sess: &SessionRef,
     idx: usize,
     connector: String,
     args: DetectArgs,
-    reader: crate::dmabuf::Reader,
+    reader: Option<crate::dmabuf::Reader>,
+    ready: Option<(Vec<u8>, i32, i32)>,
 ) {
     let (tx, rx) = std::sync::mpsc::channel();
     let name = connector.clone();
     std::thread::spawn(move || {
-        let t = std::time::Instant::now();
-        let (w, h) = (reader.width as i32, reader.height as i32);
-        let pixels = match reader.read_pixels() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("{name} 读显存像素失败: {e}");
-                return;
+        let (pixels, w, h) = match (reader, ready) {
+            (Some(reader), _) => {
+                let t = std::time::Instant::now();
+                let (w, h) = (reader.width as i32, reader.height as i32);
+                match reader.read_pixels() {
+                    Ok(p) => {
+                        trace(&format!("{name} 后台读像素花了 {} ms", t.elapsed().as_millis()));
+                        (p, w, h)
+                    }
+                    Err(e) => {
+                        eprintln!("{name} 读显存像素失败: {e}");
+                        return;
+                    }
+                }
             }
+            (None, Some((p, w, h))) => (p, w, h),
+            (None, None) => return,
         };
-        trace(&format!("{name} 后台读像素花了 {} ms", t.elapsed().as_millis()));
         let rects = detect_pixels(&pixels, w, h, &name, args);
-        let _ = tx.send((pixels, w, h, rects));
+        drop(pixels);
+        let _ = tx.send(rects);
     });
     let sess2 = sess.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
         match rx.try_recv() {
-            Ok((pixels, w, h, rects)) => {
-                finish_layer(&sess2, idx, &connector, Some((pixels, w, h)), Some(rects));
+            Ok(rects) => {
+                finish_layer(&sess2, idx, &rects);
                 glib::ControlFlow::Break
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
         }
     });
+}
+
+/// 需要像素的时候才去取：导出、打码
+///
+/// 只在两种时刻需要——用户按了复制/保存（pending），或者切到打码工具。
+/// 取法优先「后台线程从显存缓冲 mmap 读」：GPU 回读（TextureDownloader）得在
+/// 主线程做，这台机器负载高的时候实测一次能卡 3 秒，比等后台那一秒糟得多。
+fn start_pixel_broker(sess: &SessionRef) {
+    let sess2 = sess.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
+        let (want, todo) = {
+            let Ok(s) = sess2.try_borrow() else {
+                return glib::ControlFlow::Continue;
+            };
+            let d = s.doc.borrow();
+            let want = s.pending.is_some() || d.tool == Tool::Mosaic;
+            let todo: Vec<usize> = match want {
+                false => Vec::new(),
+                true => s
+                    .wanted_outputs(&d)
+                    .into_iter()
+                    .filter(|i| d.outs[*i].phys.is_none() && !s.pixels_reading.contains(i))
+                    .collect(),
+            };
+            (want, todo)
+        };
+        if want && !todo.is_empty() {
+            for i in todo {
+                fetch_pixels(&sess2, i);
+            }
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// 取一块屏的像素（后台线程读显存；没有显存缓冲才退回 GPU 下载）
+fn fetch_pixels(sess: &SessionRef, idx: usize) {
+    let (reader, texture) = {
+        let Ok(mut s) = sess.try_borrow_mut() else {
+            return;
+        };
+        let d = s.doc.borrow();
+        let Some(o) = d.outs.get(idx) else {
+            return;
+        };
+        let reader = o.keep.as_ref().map(|b| b.reader());
+        let texture = o.texture.clone();
+        drop(d);
+        s.pixels_reading.push(idx);
+        (reader, texture)
+    };
+    let Some(reader) = reader else {
+        // 共享内存那条路没有可读的缓冲，只能下载（数据本来就在内存里，是拷贝）
+        if let Some(texture) = texture {
+            if let Ok((pixels, w, h)) = export::pixels_from_texture(&texture) {
+                store_pixels(sess, idx, pixels, w, h);
+            }
+        }
+        if let Ok(mut s) = sess.try_borrow_mut() {
+            s.pixels_reading.retain(|i| *i != idx);
+        }
+        return;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (w, h) = (reader.width as i32, reader.height as i32);
+        match reader.read_pixels() {
+            Ok(pixels) => {
+                let _ = tx.send(Some((pixels, w, h)));
+            }
+            Err(e) => {
+                eprintln!("读显存像素失败: {e}");
+                let _ = tx.send(None);
+            }
+        }
+    });
+    let sess2 = sess.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+        match rx.try_recv() {
+            Ok(Some((pixels, w, h))) => {
+                store_pixels(&sess2, idx, pixels, w, h);
+                glib::ControlFlow::Break
+            }
+            Ok(None) => glib::ControlFlow::Break,
+            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        }
+    });
+}
+
+/// 像素到手：建画布（零拷贝接管这块内存），然后看看有没有等在后面的导出
+fn store_pixels(sess: &SessionRef, idx: usize, pixels: Vec<u8>, w: i32, h: i32) {
+    let surface = crate::export::surface_from_bgra_owned(pixels, w as u32, h as u32);
+    let Ok(mut s) = sess.try_borrow_mut() else {
+        return;
+    };
+    s.pixels_reading.retain(|i| *i != idx);
+    match surface {
+        Ok(surface) => {
+            if let Some(o) = s.doc.borrow_mut().outs.get_mut(idx) {
+                o.phys = Some(surface);
+            }
+        }
+        Err(e) => eprintln!("建画布失败: {e}"),
+    }
+    s.redraw();
+    s.flush_pending();
 }
 
 /// 在后台线程里扫一遍像素认窗口，结果换成全局坐标
@@ -993,51 +1150,15 @@ fn detect_pixels(
 /// 而且只能在主线程做。刚按出浮层就立刻拖框的时候，这一下正好砸在拖动的头上，
 /// 实测拖动会卡、甚至整个按下-拖动被吞掉，所以它被推迟到指针空闲时（见
 /// `pixels_ready_to_run`），用户提前按了复制/保存也会立刻补上。
-fn finish_layer(
-    sess: &SessionRef,
-    idx: usize,
-    connector: &str,
-    pixels: Option<(Vec<u8>, i32, i32)>,
-    rects: Option<Vec<crate::windows::Rect>>,
-) {
-    let t = std::time::Instant::now();
-    let doc = sess.borrow().doc.clone();
+fn finish_layer(sess: &SessionRef, idx: usize, rects: &[crate::windows::Rect]) {
     {
+        let doc = sess.borrow().doc.clone();
         let mut d = doc.borrow_mut();
         let Some(o) = d.outs.get_mut(idx) else {
             return;
         };
-        // 像素直接交给画布（零拷贝，不搬家）。
-        // 画布已经建好就别再换：用户催的时候我们可能已经用纹理下载抢先做完了
-        if let Some((pixels, w, h)) = pixels {
-            if !o.ready() {
-                match crate::export::surface_from_bgra_owned(pixels, w as u32, h as u32) {
-                    Ok(surface) => o.phys = Some(surface),
-                    Err(e) => eprintln!("建画布失败: {e}"),
-                }
-            }
-        }
-        match rects {
-            Some(r) => o.windows = r,
-            None => {
-                // 后台线程给不出结果（比如像素已经被纹理吃掉了）就地识别
-                let (sx, sy, size, origin) = (o.sx, o.sy, o.size, o.origin);
-                let Some(phys) = o.ensure_phys() else {
-                    return;
-                };
-                let mut r = crate::windows::detect_for_output(connector, phys, sx, sy, size);
-                trace(&format!("{connector} 窗口识别完（{} 块）", r.len()));
-                for r in r.iter_mut() {
-                    r.x0 += origin.0;
-                    r.x1 += origin.0;
-                    r.y0 += origin.1;
-                    r.y1 += origin.1;
-                }
-                o.windows = r;
-            }
-        }
+        o.windows = rects.to_vec();
     }
-    trace(&format!("补画布+挂窗口花了 {} ms", t.elapsed().as_millis()));
     let mut s = sess.borrow_mut();
     s.redraw();
     s.flush_pending();
@@ -1053,55 +1174,32 @@ impl Session {
         }
     }
 
-    /// 用户已经在等结果了（复制/保存），别再等他按后台那趟慢读
-    ///
-    /// 后台从显存里读像素要接近 1 秒（write-combined 映射慢），平时完全感觉
-    /// 不到；但按下复制/保存就是在要结果，这时候用 GPU 侧下载（40 ms）抢一份
-    /// 出来更划算——他此刻不会在拖框。
-    fn hurry_pixels(&mut self, idx: Option<usize>) {
-        // 跨屏选区要把碰到的每块屏都催一遍，少一块导出的图就缺一角
-        let targets: Vec<usize> = {
-            let d = self.doc.borrow();
-            match d.sel.map(|s| s.normalized()) {
-                Some(b) => (0..d.outs.len())
-                    .filter(|i| intersect(b, d.outs[*i].rect()).is_some())
-                    .collect(),
-                None => idx.or_else(|| d.sel_output()).into_iter().collect(),
-            }
-        };
-        for i in targets {
-            self.hurry_one(i);
-        }
+    /// 导出要用的像素备齐了没有（只算选区碰到的那几块屏）
+    fn pixels_ready(&self) -> bool {
+        let d = self.doc.borrow();
+        self.wanted_outputs(&d)
+            .iter()
+            .all(|i| d.outs[*i].phys.is_some())
     }
 
-    /// 催一块屏：用 GPU 侧下载抢一份像素出来，只补导出要用的画布
-    fn hurry_one(&mut self, i: usize) {
-        let texture = {
-            let d = self.doc.borrow();
-            match d.outs.get(i) {
-                Some(o) if !o.ready() => o.texture.clone(),
-                _ => None,
-            }
-        };
-        let Some(texture) = texture else {
-            return;
-        };
-        let t = std::time::Instant::now();
-        let Ok((pixels, w, h)) = export::pixels_from_texture(&texture) else {
-            return;
-        };
-        trace(&format!("催了一下像素，下载花了 {} ms", t.elapsed().as_millis()));
-        // 窗口识别还是留给后台那趟，这里只补导出要用的画布
-        if let Ok(surface) = export::surface_from_bgra_owned(pixels, w as u32, h as u32) {
-            if let Some(o) = self.doc.borrow_mut().outs.get_mut(i) {
-                o.phys = Some(surface);
-            }
+    /// 这次导出/打码要动到哪几块屏
+    fn wanted_outputs(&self, d: &Doc) -> Vec<usize> {
+        match d.sel.map(|s| s.normalized()) {
+            // 跨屏选区要把碰到的每块屏都备上，少一块导出就缺一角
+            Some(b) => (0..d.outs.len())
+                .filter(|i| intersect(b, d.outs[*i].rect()).is_some())
+                .collect(),
+            None => d
+                .sel_output()
+                .or_else(|| d.outs.first().map(|_| 0))
+                .into_iter()
+                .collect(),
         }
     }
 
     /// 画面齐了就把之前按下的完成动作做掉
     fn flush_pending(&mut self) {
-        if !self.all_ready() {
+        if !self.all_ready() || !self.pixels_ready() {
             return;
         }
         match self.pending.take() {
@@ -1815,10 +1913,9 @@ impl Session {
             return;
         }
         self.ensure_selection(idx);
-        // 像素还在后台慢慢读的话，这里抢一份出来，不让用户对着没反应等一秒
-        self.hurry_pixels(idx);
-        if !self.all_ready() {
-            trace("画面还没就绪，复制等一会儿");
+        // 像素还在后台读也没关系，先把请求挂住，读回来立刻接着做
+        if !self.all_ready() || !self.pixels_ready() {
+            trace("画面/像素还没就绪，复制等一会儿");
             self.pending = Some(Export::Copy(idx));
             return;
         }
@@ -1867,9 +1964,8 @@ impl Session {
             return;
         }
         self.ensure_selection(idx);
-        self.hurry_pixels(idx);
-        if !self.all_ready() {
-            trace("画面还没就绪，保存等一会儿");
+        if !self.all_ready() || !self.pixels_ready() {
+            trace("画面/像素还没就绪，保存等一会儿");
             self.pending = Some(Export::Save(idx));
             return;
         }

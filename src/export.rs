@@ -108,13 +108,9 @@ pub fn surface_from_bgra_owned(pixels: Vec<u8>, width: u32, height: u32) -> Resu
         .map_err(|e| format!("画布接管像素失败: {e}"))
 }
 
-/// 抓屏的 BGRA 像素直接当纹理用，接管所有权
-///
-/// GDK 的显存格式本来就认 BGRA（cairo 画布也是这个顺序），不用再整屏换通道：
-/// 5120x2160 上能省掉一次 44 MB 的搬运。抓屏出来的 alpha 都是 255，
-/// 按预乘处理与直通一致。
-pub fn texture_from_bgra_owned(pixels: Vec<u8>, w: i32, h: i32) -> gdk::Texture {
-    let bytes = glib::Bytes::from_owned(pixels);
+/// 抓屏的 BGRA 像素包成纹理，自己拷一份（像素还得留给识别窗口用）
+pub fn texture_from_bgra(pixels: &[u8], w: i32, h: i32) -> gdk::Texture {
+    let bytes = glib::Bytes::from(pixels);
     gdk::MemoryTexture::new(
         w,
         h,
