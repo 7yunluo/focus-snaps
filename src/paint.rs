@@ -84,7 +84,9 @@ pub fn paint(
             let _ = cr.save();
             cr.rectangle(bx0, by0, bx1 - bx0, by1 - by0);
             cr.clip();
-            cr.translate(-origin.0, -origin.1);
+            // 画布的坐标系是「全局」，而画面是按「本屏局部」贴的：
+            // 要把本屏的左上角挪到它在全局里的位置，所以是 +origin
+            cr.translate(origin.0, origin.1);
             cr.scale(1.0 / sx, 1.0 / sy);
             // 1:1 贴的，别让 cairo 去插值
             let pat = cairo::SurfacePattern::create(&*phys);
