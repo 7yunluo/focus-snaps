@@ -562,9 +562,14 @@ impl Session {
             let d = self.doc.borrow();
             (d.sel, d.tool)
         };
+        // 框选、缩放、移动选区期间先不显示工具条，松手后再出现
+        let selecting = matches!(
+            self.drag.kind,
+            DragKind::NewSel | DragKind::Resize(_) | DragKind::Move
+        );
         for w in &self.wins {
             w.ui.sync_tool(tool);
-            let on_sel = sel.map(|s| s.out == w.idx).unwrap_or(false);
+            let on_sel = sel.map(|s| s.out == w.idx && !selecting).unwrap_or(false);
             if let (true, Some(s)) = (on_sel, sel) {
                 let area = (f64::from(w.area.width()), f64::from(w.area.height()));
                 // 先显示，measure() 才量得到自然尺寸

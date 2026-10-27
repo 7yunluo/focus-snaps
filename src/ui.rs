@@ -1,5 +1,5 @@
 // 浮层工具条、颜色、线宽与文字输入框
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::gdk;
@@ -56,28 +56,39 @@ impl Ui {
             grip.set_can_focus(false);
             let drag = gtk::GestureDrag::new();
             drag.set_button(1);
-            let start = Rc::new(std::cell::Cell::new((0.0f64, 0.0f64)));
+            // 拖动起点：指针位置 + 当时边距
+            let start: Rc<Cell<Option<(f64, f64, f64, f64)>>> = Rc::new(Cell::new(None));
             let root2 = root.clone();
             let manual2 = manual.clone();
             let area2 = area.clone();
             drag.connect_drag_begin({
                 let start = start.clone();
                 let root = root.clone();
-                move |_g, _x, _y| {
-                    start.set((
-                        f64::from(root.margin_start()),
-                        f64::from(root.margin_top()),
-                    ));
+                move |g, _x, _y| {
+                    start.set(grip_pointer(g).map(|(px, py)| {
+                        (
+                            px,
+                            py,
+                            f64::from(root.margin_start()),
+                            f64::from(root.margin_top()),
+                        )
+                    }));
                 }
             });
-            drag.connect_drag_update(move |_g, ox, oy| {
-                let (sx, sy) = start.get();
+            // 位置按指针位移算，不用手势自带的偏移
+            drag.connect_drag_update(move |g, _ox, _oy| {
+                let Some((px0, py0, mx, my)) = start.get() else {
+                    return;
+                };
+                let Some((px, py)) = grip_pointer(g) else {
+                    return;
+                };
                 let aw = f64::from(area2.width());
                 let ah = f64::from(area2.height());
                 let w = f64::from(root2.width());
                 let h = f64::from(root2.height());
-                let nx = (sx + ox).clamp(0.0, (aw - w).max(0.0));
-                let ny = (sy + oy).clamp(0.0, (ah - h).max(0.0));
+                let nx = (mx + (px - px0)).clamp(0.0, (aw - w).max(0.0));
+                let ny = (my + (py - py0)).clamp(0.0, (ah - h).max(0.0));
                 root2.set_margin_start(nx.round() as i32);
                 root2.set_margin_top(ny.round() as i32);
                 manual2.set(Some((nx, ny)));
@@ -341,6 +352,11 @@ impl Ui {
             }
         }
     }
+}
+
+/// 指针在窗口坐标里的位置，控件自身移动不会影响它
+fn grip_pointer(drag: &gtk::GestureDrag) -> Option<(f64, f64)> {
+    drag.current_event()?.position()
 }
 
 pub fn load_css() {
