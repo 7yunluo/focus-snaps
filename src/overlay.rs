@@ -114,11 +114,26 @@ pub fn run(opts: Options) -> i32 {
         crate::export::notify("FocusSnapS", "已经有一个截图浮层开着");
         return 1;
     }
+    // -o 指定的不是当前焦点显示器时先把焦点切过去：niri 只把键盘交给当前焦点输出
+    // 上的独占层表面，不然截图期间打字会落到别的应用里。退出时切回原来的焦点。
+    let restore_focus = match opts.only.as_deref() {
+        Some(want) => {
+            let prev = crate::niri::focused_output();
+            if prev.as_deref() != Some(want) {
+                crate::niri::focus_output(want);
+                prev
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+    let opts = Rc::new(opts);
+
     let app = gtk::Application::builder()
         .application_id("dev.yunluo.FocusSnapS")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
-    let opts = Rc::new(opts);
     let failed = Rc::new(std::cell::Cell::new(false));
     let failed2 = failed.clone();
     app.connect_activate(move |app| {
@@ -131,6 +146,20 @@ pub fn run(opts: Options) -> i32 {
     });
     // 命令行参数已经在本进程解析过，不能再交给 GApplication 解析
     let _ = app.run_with_args::<&str>(&[]);
+    if let Some(prev) = restore_focus {
+        // 这时层表面还没销毁，直接切焦点会被弹回来；交给脱离的小进程多试几次
+        let name = prev.replace('\'', "");
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "for i in 1 2 3 4 5 6; do sleep 0.25; niri msg action focus-monitor '{name}' \
+                 >/dev/null 2>&1; done"
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
     if failed.get() {
         1
     } else {
@@ -231,6 +260,18 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
             }
         });
         sess.borrow_mut().theme_watch = watch;
+    }
+
+    // 只看一屏时盯着焦点，被切走就抢回来，避免键漏给别的应用
+    if let Some(only) = opts.only.clone() {
+        glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+            if let Some(cur) = crate::niri::focused_output() {
+                if cur != only {
+                    crate::niri::focus_output(&only);
+                }
+            }
+            glib::ControlFlow::Continue
+        });
     }
 
     sess.borrow_mut().sync_ui();

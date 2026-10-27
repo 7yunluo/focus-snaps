@@ -80,6 +80,21 @@ pub fn active_workspace_windows(output: &str) -> Option<Vec<WinInfo>> {
     Some(out)
 }
 
+/// 当前焦点显示器的名字
+pub fn focused_output() -> Option<String> {
+    let v = run_json(&["msg", "--json", "focused-output"])?;
+    Some(v["name"].as_str()?.to_string())
+}
+
+/// 把键盘焦点切到指定显示器
+pub fn focus_output(name: &str) -> bool {
+    Command::new("niri")
+        .args(["msg", "action", "focus-monitor", name])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// 读 niri 配置里的窗口间隙，读不到就用默认值
 pub fn gaps() -> f64 {
     let home = std::env::var("HOME").unwrap_or_default();

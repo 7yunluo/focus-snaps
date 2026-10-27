@@ -1,6 +1,6 @@
 # FocusSnapS 的 Arch 包，源码来自本地打好的 tarball（见 build-pkg.sh）
 pkgname=focus-snaps
-pkgver=0.4.2
+pkgver=0.4.3
 pkgrel=1
 pkgdesc="Wayland 截图与标注工具（多显示器 / 分数缩放 / 窗口选择）"
 arch=('x86_64')

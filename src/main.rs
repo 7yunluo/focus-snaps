@@ -188,7 +188,7 @@ fn cmd_full(argv: &[String]) -> i32 {
     }
     let name = match args.value(&["--output", "-o"]) {
         Some(n) => n,
-        None => match focused_output().or_else(|| {
+        None => match niri::focused_output().or_else(|| {
             capture::probe()
                 .ok()
                 .and_then(|v| v.into_iter().next().map(|m| m.name))
@@ -375,23 +375,6 @@ fn cmd_detect(argv: &[String]) -> i32 {
         }
     }
     0
-}
-
-/// 优先用 niri 报告的焦点显示器，拿不到就返回 None
-fn focused_output() -> Option<String> {
-    let out = std::process::Command::new("niri")
-        .args(["msg", "--json", "focused-output"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let key = "\"name\":\"";
-    let start = text.find(key)? + key.len();
-    let rest = &text[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
 }
 
 fn cmd_list(argv: &[String]) -> i32 {
