@@ -9,7 +9,7 @@ use gtk::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use crate::capture;
-use crate::doc::{Doc, OutputLayer, Selection, Stroke, Tool};
+use crate::doc::{intersect, union, Doc, OutputLayer, Rect4, Selection, Stroke, Tool};
 use crate::export;
 use crate::paint::{self, HANDLE_HIT};
 use crate::ui::{Actions, Shared, Ui};
@@ -62,6 +62,10 @@ struct Win {
     window: gtk::ApplicationWindow,
     area: gtk::DrawingArea,
     ui: Ui,
+    /// 本屏在全局布局里的左上角
+    origin: (f64, f64),
+    /// 本屏在全局布局里占的矩形
+    rect: Rect4,
 }
 
 struct Session {
@@ -69,10 +73,10 @@ struct Session {
     doc: Shared,
     wins: Vec<Rc<Win>>,
     drag: DragState,
-    /// 文字工具待输入的落点
+    /// 文字工具待输入的落点（显示器下标 + 全局逻辑坐标）
     text_at: Option<(usize, f64, f64)>,
-    /// 上次重绘时选区所在的显示器
-    last_out: Option<usize>,
+    /// 上次重绘覆盖的全局矩形
+    dirty: Option<Rect4>,
     /// 主题色监听，丢掉就收不到通知
     theme_watch: Option<gio::Settings>,
     /// 当前持有键盘焦点的窗口
@@ -220,8 +224,17 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
             eprintln!("显示器 {connector} 横纵缩放不一致（{sx:.3} / {sy:.3}），画面可能轻微拉伸");
         }
         let size = (f64::from(geo.width()), f64::from(geo.height()));
-        let win_rects = crate::windows::detect_for_output(&connector, &mut phys, sx, sy, size);
-        outs.push(OutputLayer::new(size, sx, sy, phys, win_rects));
+        // GDK 给的显示器位置就是合成器的全局逻辑布局坐标，跨屏拼接全靠它
+        let origin = (f64::from(geo.x()), f64::from(geo.y()));
+        let mut win_rects = crate::windows::detect_for_output(&connector, &mut phys, sx, sy, size);
+        // 窗口矩形跟着换成全局坐标，交互就只用一套坐标系
+        for r in win_rects.iter_mut() {
+            r.x0 += origin.0;
+            r.x1 += origin.0;
+            r.y0 += origin.1;
+            r.y1 += origin.1;
+        }
+        outs.push(OutputLayer::new(origin, size, sx, sy, phys, win_rects));
         picks.push(m);
     }
 
@@ -237,7 +250,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         wins: Vec::new(),
         drag: DragState::default(),
         text_at: None,
-        last_out: Some(usize::MAX),
+        dirty: None,
         theme_watch: None,
         focused: None,
         last_click: None,
@@ -289,9 +302,8 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         glib::timeout_add_local_once(std::time::Duration::from_millis(120), move || {
             let mut s = sess.borrow_mut();
             if let Some(rect) = parse_rect(&spec) {
-                let idx = s.doc.borrow().sel.map(|x| x.out).unwrap_or(0);
+                let idx = s.doc.borrow().sel_output().unwrap_or(0);
                 s.doc.borrow_mut().sel = Some(Selection {
-                    out: idx,
                     x0: rect.0,
                     y0: rect.1,
                     x1: rect.0 + rect.2,
@@ -405,10 +417,10 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
                 let parts: Vec<&str> = spec.splitn(4, ',').collect();
                 if parts.len() >= 3 {
                     if let (Ok(x), Ok(y)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
-                        let idx = s.doc.borrow().sel.map(|s| s.out).unwrap_or(0);
+                        let idx = s.doc.borrow().sel_output().unwrap_or(0);
                         if let Some(w) = s.win_of(idx).cloned() {
                             let at = put_entry(&w, x, y);
-                            s.text_at = Some((idx, at.0, at.1));
+                            s.text_at = Some((idx, at.0 + w.origin.0, at.1 + w.origin.1));
                             // 给了线宽就走真实的大小调节路径
                             if let Some(v) = parts.get(3).and_then(|v| v.trim().parse::<f64>().ok())
                             {
@@ -423,7 +435,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
             }
             if std::env::var("FOCUSSNAPS_TEST_PALETTE").is_ok() {
                 // 自动化检查调色板：连开两次，两次摆放位置应当一致
-                let out = s.doc.borrow().sel.map(|x| x.out);
+                let out = s.doc.borrow().sel_output();
                 if let Some(w) = out.and_then(|i| s.win_of(i)).cloned() {
                     for delay in [300, 600, 750] {
                         let w = w.clone();
@@ -467,6 +479,14 @@ fn make_window(
     idx: usize,
     monitor: &gdk::Monitor,
 ) -> Win {
+    let (origin, rect) = {
+        let s = sess.borrow();
+        let doc = s.doc.borrow();
+        match doc.outs.get(idx) {
+            Some(o) => (o.origin, o.rect()),
+            None => ((0.0, 0.0), (0.0, 0.0, 0.0, 0.0)),
+        }
+    };
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .decorated(false)
@@ -548,7 +568,7 @@ fn make_window(
             let sess = sess.clone();
             move |_g, x, y| {
                 let mut s = sess.borrow_mut();
-                on_drag_begin(&mut s, idx, x, y);
+                on_drag_begin(&mut s, idx, x + origin.0, y + origin.1);
                 s.redraw();
             }
         });
@@ -573,6 +593,25 @@ fn make_window(
         area.add_controller(drag);
     }
 
+    // 左键抬起兜底：拖到另一块屏上松手时，结束事件可能落在那块屏的窗口上
+    {
+        let sess = sess.clone();
+        let click = gtk::GestureClick::new();
+        click.set_button(1);
+        click.connect_released({
+            let sess = sess.clone();
+            move |_g, _n, x, y| {
+                let mut s = sess.borrow_mut();
+                if s.drag.kind == DragKind::None {
+                    return;
+                }
+                on_drag_end(&mut s, idx, x + origin.0, y + origin.1);
+                s.redraw();
+            }
+        });
+        area.add_controller(click);
+    }
+
     // 指针进入哪块屏就把键盘焦点交给它；移动时更新悬停窗口
     {
         let sess = sess.clone();
@@ -582,14 +621,26 @@ fn make_window(
             move |_c, x, y| {
                 let mut s = sess.borrow_mut();
                 s.focus_window(idx);
-                if s.update_hover(idx, x, y) {
+                let (gx, gy) = (x + origin.0, y + origin.1);
+                let changed = s.update_hover(gx, gy);
+                if s.drag.kind != DragKind::None {
+                    // 指针跨到另一块屏上，拖拽交给这块屏接着算
+                    on_drag_update(&mut s, idx, gx, gy);
+                    s.redraw();
+                } else if changed {
                     s.redraw();
                 }
             }
         });
         motion.connect_motion(move |_c, x, y| {
             let mut s = sess.borrow_mut();
-            if s.update_hover(idx, x, y) {
+            let (gx, gy) = (x + origin.0, y + origin.1);
+            if s.drag.kind != DragKind::None {
+                on_drag_update(&mut s, idx, gx, gy);
+                s.redraw();
+                return;
+            }
+            if s.update_hover(gx, gy) {
                 s.redraw();
             }
         });
@@ -707,34 +758,45 @@ fn make_window(
         window,
         area,
         ui,
+        origin,
+        rect,
     }
 }
 
 impl Session {
-    /// 重绘：选区换了显示器时全部重绘，否则只重绘选区所在的窗口
+    /// 需要重画的范围（全局）：有选区就是选区，否则是悬停窗口
+    fn dirty_rect(&self) -> Option<Rect4> {
+        let d = self.doc.borrow();
+        if let Some(s) = d.sel {
+            return Some(s.normalized());
+        }
+        d.hover.as_ref().map(|r| (r.x0, r.y0, r.x1, r.y1))
+    }
+
+    /// 重绘：只刷「新旧脏区」碰到的屏，跨屏拖动时相关的那几块一起刷
     fn redraw(&mut self) {
-        let (sel_out, hover_out) = {
-            let d = self.doc.borrow();
-            (d.sel.map(|s| s.out), d.hover.map(|(o, _)| o))
+        let next = self.dirty_rect();
+        let dirty = match (self.dirty, next) {
+            (Some(a), Some(b)) => Some(union(a, b)),
+            // 脏区消失（比如清空了选区）就全刷，避免留下压暗的旧画面
+            _ => None,
         };
-        let owner = sel_out.or(hover_out);
-        let all = owner != self.last_out;
-        self.last_out = owner;
+        self.dirty = next;
         for w in &self.wins {
-            if all || Some(w.idx) == owner {
+            if dirty.map(|d| intersect(d, w.rect).is_some()).unwrap_or(true) {
                 w.area.queue_draw();
             }
         }
     }
 
     /// 更新悬停窗口，返回是否有变化
-    fn update_hover(&mut self, idx: usize, x: f64, y: f64) -> bool {
+    fn update_hover(&mut self, gx: f64, gy: f64) -> bool {
         let next = {
             let d = self.doc.borrow();
             if d.sel.is_some() {
                 None
             } else {
-                d.window_at(idx, x, y).map(|r| (idx, r))
+                d.window_at(gx, gy)
             }
         };
         if self.doc.borrow().hover == next {
@@ -755,22 +817,31 @@ impl Session {
             self.drag.kind,
             DragKind::NewSel | DragKind::Resize(_) | DragKind::Move
         );
+        let owner = self.doc.borrow().sel_output();
         for w in &self.wins {
             w.ui.sync_tool(tool);
-            let on_sel = sel.map(|s| s.out == w.idx && !selecting).unwrap_or(false);
+            let on_sel = owner == Some(w.idx) && sel.is_some() && !selecting;
             if let (true, Some(s)) = (on_sel, sel) {
                 let area = (f64::from(w.area.width()), f64::from(w.area.height()));
+                let r = s.normalized();
+                // 工具条是窗口里的控件，摆位得用本屏局部坐标
+                let local = (
+                    r.0 - w.origin.0,
+                    r.1 - w.origin.1,
+                    r.2 - w.origin.0,
+                    r.3 - w.origin.1,
+                );
                 // 先显示，measure() 才量得到自然尺寸
                 w.ui.root.set_visible(true);
-                w.ui.place(s.normalized(), area);
+                w.ui.place(local, area);
                 w.ui.hint.set_visible(false);
             } else {
                 w.ui.root.set_visible(false);
                 w.ui.palette.set_visible(false);
                 w.ui.hint.set_visible(sel.is_none());
             }
+            // 截图时指针始终是十字准星（只有打字时换成 I 形）
             let cursor = match tool {
-                Tool::Select => "default",
                 Tool::Text => "text",
                 _ => "crosshair",
             };
@@ -860,15 +931,9 @@ impl Session {
             return;
         }
         let Some(idx) = idx else { return };
-        let size = self.doc.borrow().outs.get(idx).map(|o| o.size);
-        if let Some(size) = size {
-            self.doc.borrow_mut().sel = Some(Selection {
-                out: idx,
-                x0: 0.0,
-                y0: 0.0,
-                x1: size.0,
-                y1: size.1,
-            });
+        let rect = self.doc.borrow().outs.get(idx).map(|o| o.rect());
+        if let Some((x0, y0, x1, y1)) = rect {
+            self.doc.borrow_mut().sel = Some(Selection { x0, y0, x1, y1 });
         }
     }
 
@@ -876,7 +941,7 @@ impl Session {
     fn do_copy(&mut self, idx: Option<usize>) {
         self.ensure_selection(idx);
         let clipboard = self
-            .win_of(self.doc.borrow().sel.map(|s| s.out).unwrap_or(0))
+            .win_of(self.doc.borrow().sel_output().unwrap_or(0))
             .or_else(|| self.wins.first())
             .map(|w| w.window.clipboard());
         let mut surface = {
@@ -1007,6 +1072,7 @@ fn on_drag_begin(s: &mut Session, idx: usize, x: f64, y: f64) {
             d.outs.get(idx).map(|o| o.size).unwrap_or((0.0, 0.0)),
         )
     };
+    // x、y 是全局逻辑坐标，跨屏框选时同一套坐标直接就能用
     s.drag = DragState {
         kind: DragKind::None,
         anchor: (x, y),
@@ -1017,11 +1083,11 @@ fn on_drag_begin(s: &mut Session, idx: usize, x: f64, y: f64) {
         moved: false,
     };
 
-    let cur = sel.filter(|s| s.out == idx).map(|s| s.normalized());
+    let cur = sel.map(|s| s.normalized());
 
     // 点在文字框上：选中它并拖动
     if tool == Tool::Select {
-        let hit = s.doc.borrow().text_at(idx, x, y);
+        let hit = s.doc.borrow().text_at(x, y);
         if let Some(i) = hit {
             let from = s.doc.borrow().strokes[i].points[0];
             s.doc.borrow_mut().text_sel = Some(i);
@@ -1047,7 +1113,6 @@ fn on_drag_begin(s: &mut Session, idx: usize, x: f64, y: f64) {
                     s.drag.kind = DragKind::NewSel;
                     let mut d = s.doc.borrow_mut();
                     d.sel = Some(Selection {
-                        out: idx,
                         x0: x,
                         y0: y,
                         x1: x,
@@ -1060,7 +1125,6 @@ fn on_drag_begin(s: &mut Session, idx: usize, x: f64, y: f64) {
                 s.drag.kind = DragKind::NewSel;
                 let mut d = s.doc.borrow_mut();
                 d.sel = Some(Selection {
-                    out: idx,
                     x0: x,
                     y0: y,
                     x1: x,
@@ -1089,7 +1153,6 @@ fn on_drag_begin(s: &mut Session, idx: usize, x: f64, y: f64) {
                 s.drag.kind = DragKind::NewSel;
                 let mut d = s.doc.borrow_mut();
                 d.sel = Some(Selection {
-                    out: idx,
                     x0: x,
                     y0: y,
                     x1: x,
@@ -1101,12 +1164,10 @@ fn on_drag_begin(s: &mut Session, idx: usize, x: f64, y: f64) {
     }
 }
 
-fn on_drag_update(s: &mut Session, idx: usize, x: f64, y: f64) {
-    let (w, h) = {
-        let d = s.doc.borrow();
-        d.outs.get(idx).map(|o| o.size).unwrap_or((0.0, 0.0))
-    };
-    let (x, y) = (x.clamp(0.0, w), y.clamp(0.0, h));
+fn on_drag_update(s: &mut Session, _idx: usize, x: f64, y: f64) {
+    // 选区可以横跨多块屏，所以夹在整个布局的包围盒里，而不是当前这块屏
+    let bbox = s.doc.borrow().bbox();
+    let (x, y) = (x.clamp(bbox.0, bbox.2), y.clamp(bbox.1, bbox.3));
     if (x - s.drag.anchor.0).abs() > 2.0 || (y - s.drag.anchor.1).abs() > 2.0 {
         s.drag.moved = true;
     }
@@ -1124,11 +1185,10 @@ fn on_drag_update(s: &mut Session, idx: usize, x: f64, y: f64) {
             let (dx, dy) = (x - s.drag.anchor.0, y - s.drag.anchor.1);
             let rw = x1 - x0;
             let rh = y1 - y0;
-            let nx0 = (x0 + dx).clamp(0.0, (w - rw).max(0.0));
-            let ny0 = (y0 + dy).clamp(0.0, (h - rh).max(0.0));
+            let nx0 = (x0 + dx).clamp(bbox.0, (bbox.2 - rw).max(bbox.0));
+            let ny0 = (y0 + dy).clamp(bbox.1, (bbox.3 - rh).max(bbox.1));
             let mut d = s.doc.borrow_mut();
             d.sel = Some(Selection {
-                out: idx,
                 x0: nx0,
                 y0: ny0,
                 x1: nx0 + rw,
@@ -1147,8 +1207,10 @@ fn on_drag_update(s: &mut Session, idx: usize, x: f64, y: f64) {
                 .get(i)
                 .and_then(|st| st.text_size)
                 .unwrap_or((0.0, 0.0));
-            let nx = (fx + dx).clamp(0.0, (w - bw).max(0.0));
-            let ny = (fy + dy).clamp(0.0, (h - bh).max(0.0));
+            // 文字框整体留在选区内
+            let area = s.doc.borrow().sel.map(|s| s.normalized()).unwrap_or(bbox);
+            let nx = (fx + dx).clamp(area.0, (area.2 - bw).max(area.0));
+            let ny = (fy + dy).clamp(area.1, (area.3 - bh).max(area.1));
             let mut d = s.doc.borrow_mut();
             if let Some(st) = d.strokes.get_mut(i) {
                 if let Some(p) = st.points.first_mut() {
@@ -1183,13 +1245,7 @@ fn on_drag_update(s: &mut Session, idx: usize, x: f64, y: f64) {
                 _ => {}
             }
             let mut d = s.doc.borrow_mut();
-            d.sel = Some(Selection {
-                out: idx,
-                x0,
-                y0,
-                x1,
-                y1,
-            });
+            d.sel = Some(Selection { x0, y0, x1, y1 });
         }
         DragKind::Draw => {
             let mut d = s.doc.borrow_mut();
@@ -1227,7 +1283,7 @@ fn on_drag_end(s: &mut Session, idx: usize, x: f64, y: f64) {
                 d.hover = None;
             } else {
                 // 没拖动：先还原，再看是不是点了某个窗口
-                let hover = s.doc.borrow().hover.filter(|(o, _)| *o == idx);
+                let hover = s.doc.borrow().hover.filter(|r| r.contains(x, y));
                 let saved_sel = s.drag.saved_sel;
                 let saved_n = s.drag.saved_strokes;
                 let saved_num = s.drag.saved_number;
@@ -1236,9 +1292,8 @@ fn on_drag_end(s: &mut Session, idx: usize, x: f64, y: f64) {
                 d.strokes.truncate(saved_n);
                 d.next_number = saved_num;
                 if saved_sel.is_none() {
-                    if let Some((_, r)) = hover {
+                    if let Some(r) = hover {
                         d.sel = Some(Selection {
-                            out: idx,
                             x0: r.x0,
                             y0: r.y0,
                             x1: r.x1,
@@ -1259,13 +1314,7 @@ fn on_drag_end(s: &mut Session, idx: usize, x: f64, y: f64) {
                 if x1 - x0 <= 4.0 || y1 - y0 <= 4.0 {
                     d.sel = s.drag.saved_sel;
                 } else {
-                    d.sel = Some(Selection {
-                        out: idx,
-                        x0,
-                        y0,
-                        x1,
-                        y1,
-                    });
+                    d.sel = Some(Selection { x0, y0, x1, y1 });
                 }
             }
         }
@@ -1295,7 +1344,6 @@ fn on_drag_end(s: &mut Session, idx: usize, x: f64, y: f64) {
                                 let ny1 = sy1.min(p0.1.max(p1.1));
                                 if nx1 - nx0 > 8.0 && ny1 - ny0 > 8.0 {
                                     d.sel = Some(Selection {
-                                        out: sel.out,
                                         x0: nx0,
                                         y0: ny0,
                                         x1: nx1,
@@ -1356,7 +1404,7 @@ fn on_click(s: &mut Session, idx: usize, x: f64, y: f64) {
     };
     let Some(sel) = sel else { return };
     let r = sel.normalized();
-    if sel.out != idx || !contains(r, x, y) {
+    if !contains(r, x, y) {
         return;
     }
     match tool {
@@ -1386,8 +1434,10 @@ fn on_click(s: &mut Session, idx: usize, x: f64, y: f64) {
                 d.text_sel = None;
             }
             if let Some(w) = win {
-                let at = put_entry(&w, x, y);
-                s.text_at = Some((idx, at.0, at.1));
+                // 输入框是窗口里的控件，摆位用本屏局部坐标，落点仍按全局坐标记
+                let (lx, ly) = (x - w.origin.0, y - w.origin.1);
+                let at = put_entry(&w, lx, ly);
+                s.text_at = Some((idx, at.0 + w.origin.0, at.1 + w.origin.1));
                 w.window.present();
                 w.ui.entry.grab_focus();
             }
@@ -1401,7 +1451,7 @@ fn on_key(s: &mut Session, idx: usize, key: gdk::Key, mods: gdk::ModifierType) -
     let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
 
     // 选区在别的屏上时应作用在选区所属的显示器
-    let sel_out = s.doc.borrow().sel.map(|x| x.out);
+    let sel_out = s.doc.borrow().sel_output();
     let target = sel_out.unwrap_or(idx);
 
     if ctrl {
@@ -1415,17 +1465,13 @@ fn on_key(s: &mut Session, idx: usize, key: gdk::Key, mods: gdk::ModifierType) -
                 return glib::Propagation::Stop;
             }
             gdk::Key::a | gdk::Key::A => {
-                let size = {
+                let rect = {
                     let d = s.doc.borrow();
-                    d.outs.get(idx).map(|o| o.size).unwrap_or((0.0, 0.0))
+                    d.outs.get(idx).map(|o| o.rect())
                 };
-                s.doc.borrow_mut().sel = Some(Selection {
-                    out: idx,
-                    x0: 0.0,
-                    y0: 0.0,
-                    x1: size.0,
-                    y1: size.1,
-                });
+                if let Some((x0, y0, x1, y1)) = rect {
+                    s.doc.borrow_mut().sel = Some(Selection { x0, y0, x1, y1 });
+                }
                 s.sync_ui();
                 s.redraw();
                 return glib::Propagation::Stop;
@@ -1483,19 +1529,15 @@ fn on_key(s: &mut Session, idx: usize, key: gdk::Key, mods: gdk::ModifierType) -
                 gdk::Key::Up => (0.0, -step),
                 _ => (0.0, step),
             };
-            let size = {
-                let d = s.doc.borrow();
-                d.outs.get(target).map(|o| o.size).unwrap_or((0.0, 0.0))
-            };
+            let bbox = s.doc.borrow().bbox();
             let mut moved = false;
             {
                 let mut d = s.doc.borrow_mut();
                 if let Some(sel) = d.sel {
                     let (x0, y0, x1, y1) = sel.normalized();
-                    let nx0 = (x0 + dx).clamp(0.0, (size.0 - (x1 - x0)).max(0.0));
-                    let ny0 = (y0 + dy).clamp(0.0, (size.1 - (y1 - y0)).max(0.0));
+                    let nx0 = (x0 + dx).clamp(bbox.0, (bbox.2 - (x1 - x0)).max(bbox.0));
+                    let ny0 = (y0 + dy).clamp(bbox.1, (bbox.3 - (y1 - y0)).max(bbox.1));
                     d.sel = Some(Selection {
-                        out: sel.out,
                         x0: nx0,
                         y0: ny0,
                         x1: nx0 + (x1 - x0),

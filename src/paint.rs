@@ -3,7 +3,7 @@ use gtk::cairo;
 use gtk::pango;
 use pangocairo::functions::{create_layout, show_layout};
 
-use crate::doc::{Doc, OutputLayer, Stroke, Tool};
+use crate::doc::{intersect, Doc, OutputLayer, Rect4, Stroke, Tool};
 
 /// 选区外压暗的强度
 const DIM: f64 = 0.45;
@@ -13,6 +13,9 @@ pub const HANDLE: f64 = 7.0;
 pub const HANDLE_HIT: f64 = 9.0;
 
 /// 画一个显示器的整块浮层，area 是窗口的实际逻辑尺寸
+///
+/// 选区、标注都存在全局逻辑坐标里，各屏把自己跟选区求交集的那一段画出来，
+/// 多画的落在 surface 外被合成器裁掉，视觉上就拼成一块连续的浮层。
 pub fn paint(
     cr: &cairo::Context,
     doc: &mut Doc,
@@ -20,43 +23,45 @@ pub fn paint(
     area: (f64, f64),
     preview: Option<(f64, f64, &str)>,
 ) {
-    let Doc {
-        outs,
-        sel,
-        strokes,
-        active,
-        tool,
-        hover,
-        text_sel,
-        width,
-        accent,
-        ..
-    } = doc;
-    let Some(out) = outs.get_mut(out_idx) else {
-        return;
+    // 本屏的参数先拷出来，后面要可变借用文档
+    let (origin, size, sx, sy, phys, out_rect) = match doc.outs.get(out_idx) {
+        Some(o) => (o.origin, o.size, o.sx, o.sy, o.phys.clone(), o.rect()),
+        None => return,
     };
+    let sel = doc.sel.map(|s| s.normalized());
+    let hover = doc.hover.as_ref().map(|r| (r.x0, r.y0, r.x1, r.y1));
+    // 尺寸徽标只在选区左上角所在的那块屏上画
+    let owner = sel.map(|s| doc.out_at(s.0, s.1)) == Some(Some(out_idx));
 
     // 画面按物理分辨率 1:1 贴到设备像素，避免二次采样发虚
     let _ = cr.save();
-    cr.scale(1.0 / out.sx, 1.0 / out.sy);
-    let _ = cr.set_source_surface(&out.phys, 0.0, 0.0);
+    cr.scale(1.0 / sx, 1.0 / sy);
+    let _ = cr.set_source_surface(&phys, 0.0, 0.0);
     let _ = cr.paint();
     let _ = cr.restore();
 
-    let sel = sel
-        .filter(|s| s.out == out_idx)
-        .map(|s| s.normalized());
+    let Doc {
+        outs,
+        strokes,
+        active,
+        tool,
+        width,
+        accent,
+        text_sel,
+        ..
+    } = doc;
 
-    // 悬停的窗口先用它当「洞」，让用户看清将选中哪一块
-    let hover_rect = hover
-        .as_ref()
-        .filter(|(o, _)| *o == out_idx)
-        .map(|(_, r)| (r.x0, r.y0, r.x1, r.y1));
+    // 选区（或悬停窗口）落在本屏上的那一段，就是遮罩要挖的洞
+    let hole = sel
+        .and_then(|s| intersect(s, out_rect))
+        .or_else(|| hover.and_then(|h| intersect(h, out_rect)));
 
-    // 选区外（或悬停窗口外）压暗
+    // 选区外（或悬停窗口外）压暗；这一步还在本屏局部坐标里画
     cr.set_source_rgba(0.0, 0.0, 0.0, DIM);
-    match sel.or(hover_rect) {
+    match hole {
         Some((x0, y0, x1, y1)) => {
+            let (x0, y0) = (x0 - origin.0, y0 - origin.1);
+            let (x1, y1) = (x1 - origin.0, y1 - origin.1);
             let (w, h) = area;
             quad(cr, 0.0, 0.0, w, y0);
             quad(cr, 0.0, y1, w, h - y1);
@@ -69,13 +74,16 @@ pub fn paint(
         }
     }
 
+    // 之后统一按全局逻辑坐标画，只是把原点挪到本屏的左上角
+    let _ = cr.save();
+    cr.translate(-origin.0, -origin.1);
+
     let Some((x0, y0, x1, y1)) = sel else {
         // 还没框选时，把指针悬停的窗口勾出来
-        if let Some((o, r)) = hover.as_ref() {
-            if *o == out_idx {
-                draw_hover(cr, r, *accent);
-            }
+        if let Some(h) = hover.filter(|h| intersect(*h, out_rect).is_some()) {
+            draw_hover(cr, h, *accent);
         }
+        let _ = cr.restore();
         return;
     };
 
@@ -84,10 +92,10 @@ pub fn paint(
     cr.rectangle(x0, y0, x1 - x0, y1 - y0);
     cr.clip();
     for s in strokes.iter() {
-        draw_stroke(cr, out, s);
+        draw_stroke(cr, outs, s);
     }
     if let Some(a) = active.as_ref() {
-        draw_stroke(cr, out, a);
+        draw_stroke(cr, outs, a);
     }
     // 正在输入的文字由输入框原地显示，这里只框出它的范围
     if let Some((px, py, text)) = preview {
@@ -100,8 +108,14 @@ pub fn paint(
     let _ = cr.restore();
 
     draw_frame(cr, (x0, y0, x1, y1), *tool == Tool::Select, *accent);
-    draw_badge(cr, out, (x0, y0, x1, y1));
     draw_text_frame(cr, strokes, *text_sel, *accent);
+    let _ = cr.restore();
+
+    if owner {
+        // 徽标按本屏局部坐标摆，才不会算错贴边
+        let local = (x0 - origin.0, y0 - origin.1, x1 - origin.0, y1 - origin.1);
+        draw_badge(cr, local, size, (sx, sy));
+    }
 }
 
 fn quad(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64) {
@@ -110,12 +124,13 @@ fn quad(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64) {
     }
 }
 
-/// 悬停窗口的高亮框
-fn draw_hover(cr: &cairo::Context, r: &crate::windows::Rect, accent: (f64, f64, f64)) {
+/// 悬停窗口的高亮框（全局逻辑坐标）
+fn draw_hover(cr: &cairo::Context, r: Rect4, accent: (f64, f64, f64)) {
+    let (x0, y0, x1, y1) = r;
     let _ = cr.save();
     cr.set_source_rgba(accent.0, accent.1, accent.2, 0.95);
     cr.set_line_width(2.0);
-    cr.rectangle(r.x0, r.y0, r.width(), r.height());
+    cr.rectangle(x0, y0, x1 - x0, y1 - y0);
     let _ = cr.stroke();
     let _ = cr.restore();
 }
@@ -196,10 +211,15 @@ pub fn handle_points(r: (f64, f64, f64, f64)) -> [(f64, f64); 8] {
 }
 
 /// 选区尺寸徽标，显示物理像素
-fn draw_badge(cr: &cairo::Context, out: &OutputLayer, r: (f64, f64, f64, f64)) {
+fn draw_badge(
+    cr: &cairo::Context,
+    r: Rect4,
+    size: (f64, f64),
+    scale: (f64, f64),
+) {
     let (x0, y0, x1, y1) = r;
-    let wpx = ((x1 - x0) * out.sx).round() as i64;
-    let hpx = ((y1 - y0) * out.sy).round() as i64;
+    let wpx = ((x1 - x0) * scale.0).round() as i64;
+    let hpx = ((y1 - y0) * scale.1).round() as i64;
     let label = format!("{wpx} × {hpx}");
     let layout = text_layout(cr, &label, 13.0, false);
     let (tw, th) = layout.pixel_size();
@@ -207,13 +227,13 @@ fn draw_badge(cr: &cairo::Context, out: &OutputLayer, r: (f64, f64, f64, f64)) {
     let bw = tw as f64 + pad * 2.0;
     let bh = th as f64 + 6.0;
     // 优先放在选区上方，其次下方，都放不下就压进选区内部并保证不出界
-    let bx = x0.clamp(2.0, (out.size.0 - bw - 2.0).max(2.0));
+    let bx = x0.clamp(2.0, (size.0 - bw - 2.0).max(2.0));
     let by = if y0 - bh - 6.0 >= 2.0 {
         y0 - bh - 6.0
-    } else if y1 + 6.0 + bh <= out.size.1 - 2.0 {
+    } else if y1 + 6.0 + bh <= size.1 - 2.0 {
         y1 + 6.0
     } else {
-        (y0 + 6.0).clamp(2.0, (out.size.1 - bh - 2.0).max(2.0))
+        (y0 + 6.0).clamp(2.0, (size.1 - bh - 2.0).max(2.0))
     };
 
     let _ = cr.save();
@@ -279,8 +299,8 @@ pub fn text_size(surface: &cairo::ImageSurface, text: &str, px: f64) -> Option<(
     Some((f64::from(w), f64::from(h)))
 }
 
-/// 画一笔标注
-pub fn draw_stroke(cr: &cairo::Context, out: &mut OutputLayer, s: &Stroke) {
+/// 画一笔标注（全局逻辑坐标）
+pub fn draw_stroke(cr: &cairo::Context, outs: &mut [OutputLayer], s: &Stroke) {
     let (r, g, b) = s.color;
     match s.tool {
         Tool::Brush | Tool::Highlighter => {
@@ -314,7 +334,7 @@ pub fn draw_stroke(cr: &cairo::Context, out: &mut OutputLayer, s: &Stroke) {
             let (x0, y0) = s.points[0];
             let (x1, y1) = s.points[1];
             match s.tool {
-                Tool::Mosaic => paint_mosaic(cr, out, (x0, y0), (x1, y1)),
+                Tool::Mosaic => paint_mosaic(cr, outs, (x0, y0), (x1, y1)),
                 Tool::Crop => {
                     let _ = cr.save();
                     cr.set_source_rgba(r, g, b, 0.9);
@@ -412,16 +432,27 @@ pub fn draw_stroke(cr: &cairo::Context, out: &mut OutputLayer, s: &Stroke) {
 }
 
 /// 区域打码：从原画面按块取平均色再填实心方块
-fn paint_mosaic(cr: &cairo::Context, out: &mut OutputLayer, a: (f64, f64), b: (f64, f64)) {
-    let x0 = a.0.min(b.0).max(0.0);
-    let y0 = a.1.min(b.1).max(0.0);
-    let x1 = a.0.max(b.0).min(out.size.0);
-    let y1 = a.1.max(b.1).min(out.size.1);
-    if x1 <= x0 || y1 <= y0 {
-        return;
+///
+/// 打码块跨越屏边界时，按屏切开分别取各自画面的像素。
+fn paint_mosaic(cr: &cairo::Context, outs: &mut [OutputLayer], a: (f64, f64), b: (f64, f64)) {
+    let want = (
+        a.0.min(b.0),
+        a.1.min(b.1),
+        a.0.max(b.0),
+        a.1.max(b.1),
+    );
+    for out in outs.iter_mut() {
+        if let Some(r) = intersect(want, out.rect()) {
+            mosaic_piece(cr, out, r);
+        }
     }
+}
+
+/// 在一块屏的范围内打码，r 是全局逻辑坐标
+fn mosaic_piece(cr: &cairo::Context, out: &mut OutputLayer, r: Rect4) {
     let stride = out.phys.stride() as usize;
     let (bw, bh) = (out.phys.width(), out.phys.height());
+    let (x0, y0, x1, y1) = r;
     let data = match out.phys.data() {
         Ok(d) => d,
         Err(_) => return,
@@ -429,11 +460,16 @@ fn paint_mosaic(cr: &cairo::Context, out: &mut OutputLayer, a: (f64, f64), b: (f
     // 块大小随缩放微调，观感上始终是 12 逻辑像素
     let block = 12.0;
     let step = 3usize;
+    // 块网格对齐到全局坐标，跨屏时纹路才是连续的
+    let gx0 = (x0 / block).floor() * block;
+    let gy0 = (y0 / block).floor() * block;
 
     let _ = cr.save();
-    let mut y = y0;
+    cr.rectangle(x0, y0, x1 - x0, y1 - y0);
+    cr.clip();
+    let mut y = gy0;
     while y < y1 {
-        let mut x = x0;
+        let mut x = gx0;
         while x < x1 {
             let px0 = ((x * out.sx).round() as i32).clamp(0, bw - 1) as usize;
             let py0 = ((y * out.sy).round() as i32).clamp(0, bh - 1) as usize;
@@ -503,6 +539,7 @@ mod tests {
         phys.mark_dirty();
         Doc::new(
             vec![OutputLayer::new(
+                (0.0, 0.0),
                 (lw as f64, lh as f64),
                 sx,
                 sx,
@@ -514,10 +551,14 @@ mod tests {
     }
 
     fn render(doc: &mut Doc, w: i32, h: i32) -> (Vec<u8>, usize) {
+        render_out(doc, 0, w, h)
+    }
+
+    fn render_out(doc: &mut Doc, idx: usize, w: i32, h: i32) -> (Vec<u8>, usize) {
         let mut target = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).unwrap();
         {
             let cr = cairo::Context::new(&target).unwrap();
-            paint(&cr, doc, 0, (w as f64, h as f64), None);
+            paint(&cr, doc, idx, (w as f64, h as f64), None);
             let _ = cr.show_page();
         }
         let mut data = vec![0u8; (w * h * 4) as usize];
@@ -541,7 +582,6 @@ mod tests {
     fn paints_dim_outside_and_keeps_selection_bright() {
         let mut doc = doc_with(400, 200, 2.0);
         doc.sel = Some(Selection {
-            out: 0,
             x0: 100.0,
             y0: 50.0,
             x1: 200.0,
@@ -560,6 +600,50 @@ mod tests {
     }
 
     #[test]
+    fn paints_selection_slice_on_each_output() {
+        // 两块 200x100 逻辑、1 倍缩放的屏并排，选区从第一块横跨到第二块
+        let mut doc = doc_with(200, 100, 1.0);
+        let mut phys = cairo::ImageSurface::create(cairo::Format::ARgb32, 200, 100).unwrap();
+        {
+            let stride = phys.stride() as usize;
+            let mut data = phys.data().unwrap();
+            for y in 0..100usize {
+                for x in 0..200usize {
+                    let i = y * stride + x * 4;
+                    data[i] = 200;
+                    data[i + 1] = 200;
+                    data[i + 2] = 200;
+                    data[i + 3] = 255;
+                }
+            }
+        }
+        phys.mark_dirty();
+        doc.outs.push(OutputLayer::new(
+            (200.0, 0.0),
+            (200.0, 100.0),
+            1.0,
+            1.0,
+            phys,
+            Vec::new(),
+        ));
+        doc.sel = Some(Selection {
+            x0: 150.0,
+            y0: 20.0,
+            x1: 250.0,
+            y1: 60.0,
+        });
+        // 第一块屏：本屏 x 150..200 那一段保持原亮度，其余压暗
+        let (data, w) = render_out(&mut doc, 0, 200, 100);
+        assert!(gray(&data, w, 160, 40) >= 195, "左屏选区内 {}", gray(&data, w, 160, 40));
+        assert!(gray(&data, w, 100, 40) <= 120, "左屏选区外 {}", gray(&data, w, 100, 40));
+        assert!(gray(&data, w, 110, 90) <= 120, "左屏选区下方 {}", gray(&data, w, 110, 90));
+        // 第二块屏：本屏 x 0..50 那一段是亮的，右边压暗
+        let (data, w) = render_out(&mut doc, 1, 200, 100);
+        assert!(gray(&data, w, 25, 40) >= 195, "右屏选区内 {}", gray(&data, w, 25, 40));
+        assert!(gray(&data, w, 100, 40) <= 120, "右屏选区外 {}", gray(&data, w, 100, 40));
+    }
+
+    #[test]
     fn paints_without_selection() {
         let mut doc = doc_with(400, 200, 2.0);
         let (data, w) = render(&mut doc, 400, 200);
@@ -572,7 +656,6 @@ mod tests {
         let mut doc = doc_with(400, 200, 2.0);
         for (x0, y0) in [(0.0, 0.0), (399.0, 199.0), (200.0, 100.0)] {
             doc.sel = Some(Selection {
-                out: 0,
                 x0,
                 y0,
                 x1: x0,
@@ -582,7 +665,6 @@ mod tests {
         }
         // 反向选区（从右下往左上拖）
         doc.sel = Some(Selection {
-            out: 0,
             x0: 300.0,
             y0: 150.0,
             x1: 100.0,

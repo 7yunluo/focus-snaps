@@ -6,7 +6,7 @@ use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
 
-use crate::doc::Doc;
+use crate::doc::{intersect, Doc};
 use crate::paint::draw_stroke;
 
 /// 把抓屏得到的 BGRA 像素包成画布
@@ -36,58 +36,64 @@ pub fn surface_from_bgra(width: u32, height: u32, pixels: &[u8]) -> Result<cairo
     Ok(surface)
 }
 
-/// 渲染一段区域：逻辑坐标 (x0,y0,x1,y1) → 按物理分辨率输出
-fn render_rect(
-    doc: &mut Doc,
-    out_idx: usize,
-    r: (f64, f64, f64, f64),
-) -> Result<cairo::ImageSurface, String> {
+/// 渲染选区：跨屏时把各屏画面在物理像素上拼成一张整图
+pub fn render_selection(doc: &mut Doc) -> Result<cairo::ImageSurface, String> {
+    let sel = doc.sel.ok_or("还没有选区")?.normalized();
     let Doc { outs, strokes, .. } = doc;
-    let Some(out) = outs.get_mut(out_idx) else {
-        return Err("选区所属的显示器已失效".into());
-    };
-    // 夹到显示器范围内，并对齐到物理像素边界，避免整图重采样
-    let x0 = r.0.max(0.0);
-    let y0 = r.1.max(0.0);
-    let x1 = r.2.min(out.size.0).max(x0 + 1.0);
-    let y1 = r.3.min(out.size.1).max(y0 + 1.0);
-    let px0 = (x0 * out.sx).round();
-    let py0 = (y0 * out.sy).round();
-    let pw = ((x1 * out.sx).round() - px0).max(1.0) as i32;
-    let ph = ((y1 * out.sy).round() - py0).max(1.0) as i32;
-    let lw = (x1 - x0).max(0.1);
-    let lh = (y1 - y0).max(0.1);
+
+    // 逐屏算出跟选区的交集；参考缩放取最大的一档，避免把画面降采样
+    let mut hits = Vec::new();
+    let (mut kx, mut ky) = (0.0f64, 0.0f64);
+    for (i, o) in outs.iter().enumerate() {
+        if let Some(r) = intersect(sel, o.rect()) {
+            hits.push((i, r));
+            kx = kx.max(o.sx);
+            ky = ky.max(o.sy);
+        }
+    }
+    if hits.is_empty() {
+        return Err("选区不在任何显示器上".into());
+    }
+    let lw = (sel.2 - sel.0).max(0.1);
+    let lh = (sel.3 - sel.1).max(0.1);
+    let pw = ((lw * kx).round().max(1.0)) as i32;
+    let ph = ((lh * ky).round().max(1.0)) as i32;
     let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, pw, ph)
         .map_err(|e| format!("创建输出画布失败: {e}"))?;
     {
         let cr = cairo::Context::new(&surface).map_err(|e| format!("建立绘图上下文失败: {e}"))?;
-        // 底图：物理像素 1:1 贴到画布左上角
-        let _ = cr.save();
-        cr.translate(-px0, -py0);
-        let pat = cairo::SurfacePattern::create(&out.phys);
-        pat.set_filter(cairo::Filter::Nearest);
-        if cr.set_source(&pat).is_ok() {
-            let _ = cr.paint();
+
+        // 底图：每块屏把自己那一段贴到画布上对应的位置
+        for (i, r) in &hits {
+            let o = &outs[*i];
+            let px0 = ((r.0 - o.origin.0) * o.sx).round();
+            let py0 = ((r.1 - o.origin.1) * o.sy).round();
+            let _ = cr.save();
+            cr.translate((r.0 - sel.0) * kx, (r.1 - sel.1) * ky);
+            cr.scale(kx / o.sx, ky / o.sy);
+            cr.translate(-px0, -py0);
+            let pat = cairo::SurfacePattern::create(&o.phys);
+            pat.set_filter(cairo::Filter::Nearest);
+            if cr.set_source(&pat).is_ok() {
+                let _ = cr.paint();
+            }
+            let _ = cr.restore();
         }
-        let _ = cr.restore();
-        // 标注：逻辑坐标映射到同一张画布
+
+        // 标注：全局逻辑坐标映射到同一张画布
         let _ = cr.save();
-        cr.scale(pw as f64 / lw, ph as f64 / lh);
-        cr.translate(-x0, -y0);
+        cr.scale(kx, ky);
+        cr.translate(-sel.0, -sel.1);
+        cr.rectangle(sel.0, sel.1, sel.2 - sel.0, sel.3 - sel.1);
+        cr.clip();
         for s in strokes.iter() {
-            draw_stroke(&cr, out, s);
+            draw_stroke(&cr, outs, s);
         }
         let _ = cr.restore();
         let _ = cr.show_page();
     }
     surface.flush();
     Ok(surface)
-}
-
-/// 渲染当前选区
-pub fn render_selection(doc: &mut Doc) -> Result<cairo::ImageSurface, String> {
-    let sel = doc.sel.ok_or("还没有选区")?;
-    render_rect(doc, sel.out, sel.normalized())
 }
 
 /// 画布转 RGBA8 字节
@@ -214,7 +220,7 @@ mod tests {
     use crate::doc::OutputLayer;
 
     /// 造一块 (逻辑宽, 逻辑高, 缩放) 的显示器画面，R 通道编码 x、G 通道编码 y
-    fn layer(lw: i32, lh: i32, sx: f64, sy: f64) -> OutputLayer {
+    fn layer_at(origin: (f64, f64), lw: i32, lh: i32, sx: f64, sy: f64) -> OutputLayer {
         let pw = (lw as f64 * sx).round() as i32;
         let ph = (lh as f64 * sy).round() as i32;
         let mut phys = cairo::ImageSurface::create(cairo::Format::ARgb32, pw, ph).unwrap();
@@ -232,14 +238,36 @@ mod tests {
             }
         }
         phys.mark_dirty();
-        OutputLayer::new((lw as f64, lh as f64), sx, sy, phys, Vec::new())
+        OutputLayer::new(
+            origin,
+            (lw as f64, lh as f64),
+            sx,
+            sy,
+            phys,
+            Vec::new(),
+        )
+    }
+
+    fn layer(lw: i32, lh: i32, sx: f64, sy: f64) -> OutputLayer {
+        layer_at((0.0, 0.0), lw, lh, sx, sy)
+    }
+
+    /// 直接按选区渲染
+    fn render(doc: &mut Doc, sel: (f64, f64, f64, f64)) -> cairo::ImageSurface {
+        doc.sel = Some(crate::doc::Selection {
+            x0: sel.0,
+            y0: sel.1,
+            x1: sel.2,
+            y1: sel.3,
+        });
+        render_selection(doc).unwrap()
     }
 
     #[test]
     fn render_rect_maps_physical_pixels_exactly() {
         // 逻辑 40x20，2 倍缩放 → 物理 80x40
         let mut doc = Doc::new(vec![layer(40, 20, 2.0, 2.0)], "/tmp".into());
-        let mut out = render_rect(&mut doc, 0, (10.0, 5.0, 20.0, 10.0)).unwrap();
+        let mut out = render(&mut doc, (10.0, 5.0, 20.0, 10.0));
         // 选区 10x5 逻辑 → 20x10 物理
         assert_eq!((out.width(), out.height()), (20, 10));
         let (rgba, w, _) = surface_rgba(&mut out).unwrap();
@@ -257,13 +285,37 @@ mod tests {
     fn render_rect_handles_fractional_scale() {
         // 逻辑 100x50，1.4 倍 → 物理 140x70
         let mut doc = Doc::new(vec![layer(100, 50, 1.4, 1.4)], "/tmp".into());
-        let mut out = render_rect(&mut doc, 0, (10.0, 10.0, 60.0, 40.0)).unwrap();
+        let mut out = render(&mut doc, (10.0, 10.0, 60.0, 40.0));
         assert_eq!((out.width(), out.height()), (70, 42));
         let (rgba, w, _) = surface_rgba(&mut out).unwrap();
         let px = |x: usize, y: usize, c: usize| rgba[(y * w as usize + x) * 4 + c] as f64;
         // 物理起点 10*1.4=14，+0.5 采样偏移
         assert!((px(0, 0, 0) - 14.5).abs() <= 2.0, "R={}", px(0, 0, 0));
         assert!((px(0, 0, 1) - 14.5).abs() <= 2.0, "G={}", px(0, 0, 1));
+    }
+
+    #[test]
+    fn render_selection_stitches_outputs() {
+        // 两块 40x20 逻辑、2 倍缩放的屏并排，横跨两屏选一条带
+        let mut doc = Doc::new(
+            vec![
+                layer_at((0.0, 0.0), 40, 20, 2.0, 2.0),
+                layer_at((40.0, 0.0), 40, 20, 2.0, 2.0),
+            ],
+            "/tmp".into(),
+        );
+        let mut out = render(&mut doc, (30.0, 5.0, 50.0, 15.0));
+        // 20 逻辑宽 → 40 物理宽，10 逻辑高 → 20 物理高
+        assert_eq!((out.width(), out.height()), (40, 20));
+        let (rgba, w, _) = surface_rgba(&mut out).unwrap();
+        let px = |x: usize, y: usize, c: usize| rgba[(y * w as usize + x) * 4 + c] as i32;
+        // 左半段来自第一块屏：物理 x 从 60 起，y 从 10 起
+        assert!((px(0, 0, 0) - 60).abs() <= 1, "左半 R={}", px(0, 0, 0));
+        assert!((px(0, 0, 1) - 10).abs() <= 1, "左半 G={}", px(0, 0, 1));
+        // 右半段来自第二块屏，它的本地 x 从 0 重新开始
+        assert!((px(20, 0, 0) - 0).abs() <= 1, "右半 R={}", px(20, 0, 0));
+        assert!((px(39, 19, 0) - 19).abs() <= 1, "右半末 R={}", px(39, 19, 0));
+        assert!(rgba.chunks_exact(4).all(|p| p[3] == 255));
     }
 
     #[test]
