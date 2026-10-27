@@ -12,6 +12,32 @@ pub const HANDLE: f64 = 7.0;
 /// 手柄命中半径（逻辑像素）
 pub const HANDLE_HIT: f64 = 9.0;
 
+/// 标注层的余量（逻辑像素）：手柄、边框伸出去的部分，加上选区上方那块尺寸徽标
+pub const ANNOT_PAD: f64 = 34.0;
+
+/// 标注层需要覆盖的范围（本屏局部坐标）
+///
+/// 只画会画出东西的那一块：选区（或悬停窗口）加余量，再裁进本屏。
+/// 返回 None 表示这屏上什么都不用画，图层可以整个藏起来。
+pub fn annot_rect(live: Option<Rect4>, out_rect: Rect4) -> Option<Rect4> {
+    let r = intersect(live?, out_rect)?;
+    let x0 = (r.0 - ANNOT_PAD).max(out_rect.0);
+    let y0 = (r.1 - ANNOT_PAD).max(out_rect.1);
+    let x1 = (r.2 + ANNOT_PAD).min(out_rect.2);
+    let y1 = (r.3 + ANNOT_PAD).min(out_rect.3);
+    let local = (
+        x0 - out_rect.0,
+        y0 - out_rect.1,
+        x1 - out_rect.0,
+        y1 - out_rect.1,
+    );
+    if local.2 > local.0 && local.3 > local.1 {
+        Some(local)
+    } else {
+        None
+    }
+}
+
 /// 压暗要挖的洞：选区（或悬停窗口）跟本屏的交集，换算成本屏局部坐标
 ///
 /// 跨屏选区时每块屏挖自己这一段的洞，拼起来就是连续的一块。
@@ -58,9 +84,15 @@ pub fn dim_rects(hole: Option<Rect4>, area: (f64, f64)) -> Vec<Rect4> {
 ///
 /// 屏幕画面在下层由 GtkPicture 合成、压暗在上层由 CSS 矩形铺，这里都不管。
 ///
-/// 选区、标注都存在全局逻辑坐标里，各屏把自己跟选区求交集的那一段画出来，
-/// 多画的落在 surface 外被合成器裁掉，视觉上就拼成一块连续的浮层。
-pub fn paint(cr: &cairo::Context, doc: &mut Doc, out_idx: usize, preview: Option<(f64, f64, &str)>) {
+/// 选区、标注都存在全局逻辑坐标里。`view` 是这张画布左上角的全局坐标：
+/// 画布只覆盖会画出东西的那块地方（选区加上一点余量），不用铺满整屏。
+pub fn paint(
+    cr: &cairo::Context,
+    doc: &mut Doc,
+    out_idx: usize,
+    view: (f64, f64),
+    preview: Option<(f64, f64, &str)>,
+) {
     // 本屏的参数先拷出来，后面要可变借用文档
     let (origin, size, sx, sy, out_rect) = match doc.outs.get(out_idx) {
         Some(o) => (o.origin, o.size, o.sx, o.sy, o.rect()),
@@ -82,9 +114,9 @@ pub fn paint(cr: &cairo::Context, doc: &mut Doc, out_idx: usize, preview: Option
         ..
     } = doc;
 
-    // 之后统一按全局逻辑坐标画，只是把原点挪到本屏的左上角
+    // 之后统一按全局逻辑坐标画，只是把原点挪到画布左上角
     let _ = cr.save();
-    cr.translate(-origin.0, -origin.1);
+    cr.translate(-view.0, -view.1);
 
     let Some((x0, y0, x1, y1)) = sel else {
         // 还没框选时，把指针悬停的窗口勾出来
@@ -120,9 +152,11 @@ pub fn paint(cr: &cairo::Context, doc: &mut Doc, out_idx: usize, preview: Option
     let _ = cr.restore();
 
     if owner {
-        // 徽标按本屏局部坐标摆，才不会算错贴边
-        let local = (x0 - origin.0, y0 - origin.1, x1 - origin.0, y1 - origin.1);
-        draw_badge(cr, local, size, (sx, sy));
+        // 徽标按本屏局部坐标摆才不会算错贴边，所以先切回屏幕坐标再画
+        let _ = cr.save();
+        cr.translate(origin.0 - view.0, origin.1 - view.1);
+        draw_badge(cr, (x0 - origin.0, y0 - origin.1, x1 - origin.0, y1 - origin.1), size, (sx, sy));
+        let _ = cr.restore();
     }
 }
 
@@ -563,7 +597,8 @@ mod tests {
             // 下层画面如今由 GtkPicture 合成，这里铺一层同样的浅灰当作它
             cr.set_source_rgb(200.0 / 255.0, 200.0 / 255.0, 200.0 / 255.0);
             let _ = cr.paint();
-            paint(&cr, doc, idx, None);
+            let view = doc.outs[idx].origin;
+            paint(&cr, doc, idx, view, None);
             let _ = cr.show_page();
         }
         let mut data = vec![0u8; (w * h * 4) as usize];
@@ -674,6 +709,36 @@ mod tests {
         // 选区完全在别的屏上时，本屏整块压暗
         assert_eq!(hole_rect(Some((500.0, 50.0, 600.0, 80.0)), None, out_rect), None);
         assert_eq!(dim_rects(None, (400.0, 200.0)), vec![(0.0, 0.0, 400.0, 200.0)]);
+    }
+
+    #[test]
+    fn annot_rect_pads_live_area_and_clamps_to_screen() {
+        let out_rect = (0.0, 0.0, 1000.0, 800.0);
+        let pad = ANNOT_PAD;
+        // 屏幕中间的选区：四周各留一点余量
+        assert_eq!(
+            annot_rect(Some((100.0, 100.0, 300.0, 200.0)), out_rect),
+            Some((100.0 - pad, 100.0 - pad, 300.0 + pad, 200.0 + pad))
+        );
+        // 贴边的选区裁在本屏内
+        assert_eq!(
+            annot_rect(Some((0.0, 0.0, 300.0, 200.0)), out_rect),
+            Some((0.0, 0.0, 300.0 + pad, 200.0 + pad))
+        );
+        // 跨屏选区：本屏只取自己那一段
+        assert_eq!(
+            annot_rect(Some((900.0, 100.0, 1400.0, 200.0)), out_rect),
+            Some((900.0 - pad, 100.0 - pad, 1000.0, 200.0 + pad))
+        );
+        // 没有选区也没有悬停窗口，整层可以藏起来
+        assert_eq!(annot_rect(None, out_rect), None);
+        // 选区完全在别的屏上
+        assert_eq!(
+            annot_rect(Some((2000.0, 0.0, 2100.0, 100.0)), out_rect),
+            None
+        );
+        // 全屏选区是退化的最坏情况，仍然是整屏
+        assert_eq!(annot_rect(Some(out_rect), out_rect), Some(out_rect));
     }
 
     #[test]

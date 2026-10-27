@@ -60,7 +60,12 @@ impl Default for DragState {
 struct Win {
     idx: usize,
     window: gtk::ApplicationWindow,
-    area: gtk::DrawingArea,
+    /// 本屏画面，铺满整屏；手势和光标都挂在它上面
+    screen: gtk::Picture,
+    /// 标注层，尺寸跟着选区走，通常只有屏幕的一小块
+    annot: gtk::DrawingArea,
+    /// 标注层左上角的全局逻辑坐标
+    view: Rc<std::cell::Cell<(f64, f64)>>,
     /// 压暗的矩形，洞以外切成上/下/左/右四块，由 CSS 上色
     dim: [gtk::Box; 4],
     ui: Ui,
@@ -274,7 +279,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
             s.doc.borrow_mut().accent = c;
             crate::ui::set_accent(c);
             for w in &s.wins {
-                w.area.queue_draw();
+                w.annot.queue_draw();
             }
         });
         sess.borrow_mut().theme_watch = watch;
@@ -294,6 +299,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
 
     sess.borrow_mut().sync_ui();
     sess.borrow().sync_dim();
+    sess.borrow().sync_annot();
     let color = sess.borrow().doc.borrow().color;
     for w in sess.borrow().wins.clone() {
         w.ui.sync_color(color);
@@ -448,8 +454,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
                         glib::timeout_add_local_once(
                             std::time::Duration::from_millis(delay),
                             move || {
-                                let area =
-                                    (f64::from(w.area.width()), f64::from(w.area.height()));
+                                let area = (f64::from(w.screen.width()), f64::from(w.screen.height()));
                                 w.ui.toggle_palette(area);
                             },
                         );
@@ -511,11 +516,16 @@ fn make_window(
     if let Some(texture) = texture {
         picture.set_paintable(Some(&texture));
     }
+    // 手势和光标就挂在画面这一层：下面没有别的东西了
+    picture.set_cursor_from_name(Some("crosshair"));
 
-    let area = gtk::DrawingArea::new();
-    area.set_hexpand(true);
-    area.set_vexpand(true);
-    area.set_cursor_from_name(Some("crosshair"));
+    // 标注层尺寸跟着选区走（见 sync_annot），平时只覆盖屏幕的一小块
+    let annot = gtk::DrawingArea::new();
+    annot.set_can_target(false);
+    annot.set_halign(gtk::Align::Start);
+    annot.set_valign(gtk::Align::Start);
+    annot.set_visible(false);
+    let view: Rc<std::cell::Cell<(f64, f64)>> = Rc::new(std::cell::Cell::new(origin));
 
     // 压暗交给 4 块 CSS 实心矩形：合成器直接填色块，不占 CPU
     let dim = std::array::from_fn(|_| gtk::Box::new(gtk::Orientation::Vertical, 0));
@@ -534,8 +544,9 @@ fn make_window(
         overlay.set_measure_overlay(d, false);
         overlay.set_clip_overlay(d, true);
     }
-    overlay.add_overlay(&area);
-    overlay.set_measure_overlay(&area, false);
+    overlay.add_overlay(&annot);
+    overlay.set_measure_overlay(&annot, false);
+    overlay.set_clip_overlay(&annot, true);
 
     let actions = Actions {
         on_copy: {
@@ -560,7 +571,7 @@ fn make_window(
             })
         },
     };
-    let ui = Ui::build(&sess.borrow().doc, &area, &actions);
+    let ui = Ui::build(&sess.borrow().doc, &picture, &annot, &actions);
     overlay.add_overlay(&ui.root);
     overlay.add_overlay(&ui.palette);
     overlay.add_overlay(&ui.entry);
@@ -578,7 +589,8 @@ fn make_window(
     {
         let sess = sess.clone();
         let entry = ui.entry.clone();
-        area.set_draw_func(move |_a, cr, _w, _h| {
+        let view = view.clone();
+        annot.set_draw_func(move |_a, cr, _w, _h| {
             let Ok(s) = sess.try_borrow() else { return };
             let Ok(mut doc) = s.doc.try_borrow_mut() else {
                 return;
@@ -591,7 +603,7 @@ fn make_window(
             let preview = preview
                 .as_ref()
                 .map(|(x, y, t)| (*x, *y, t.as_str()));
-            paint::paint(cr, &mut doc, idx, preview);
+            paint::paint(cr, &mut doc, idx, view.get(), preview);
         });
     }
 
@@ -626,7 +638,7 @@ fn make_window(
                 s.redraw();
             }
         });
-        area.add_controller(drag);
+        picture.add_controller(drag);
     }
 
     // 左键抬起兜底：拖到另一块屏上松手时，结束事件可能落在那块屏的窗口上
@@ -645,7 +657,7 @@ fn make_window(
                 s.redraw();
             }
         });
-        area.add_controller(click);
+        picture.add_controller(click);
     }
 
     // 指针进入哪块屏就把键盘焦点交给它；移动时更新悬停窗口
@@ -684,7 +696,7 @@ fn make_window(
         if std::env::var("FOCUSSNAPS_TEST_POINTER").is_ok() {
             motion.connect_motion(|_, x, y| eprintln!("POS {x:.1} {y:.1}"));
         }
-        area.add_controller(motion);
+        picture.add_controller(motion);
     }
 
     // 右键：清掉选区 / 退出
@@ -706,7 +718,7 @@ fn make_window(
                 }
             }
         });
-        area.add_controller(right);
+        picture.add_controller(right);
     }
 
     // 滚轮：原地调整文字字号
@@ -727,7 +739,7 @@ fn make_window(
             s.redraw();
             glib::Propagation::Stop
         });
-        area.add_controller(scroll);
+        picture.add_controller(scroll);
     }
 
     // 文字输入：边打字边在画面上预览
@@ -792,7 +804,9 @@ fn make_window(
     Win {
         idx,
         window,
-        area,
+        screen: picture.clone(),
+        annot,
+        view,
         dim,
         ui,
         origin,
@@ -850,9 +864,58 @@ impl Session {
         }
     }
 
+    /// 让标注层只覆盖会画出东西的那一块：选区（或悬停窗口）加余量
+    ///
+    /// 以前这层铺满整屏，每帧都要把整块屏（5120x2160 是 44 MB）重新光栅化
+    /// 并上传成纹理；缩到选区大小之后，拖拽时每帧只有几个像素的活要干。
+    fn sync_annot(&self) {
+        let live = {
+            let d = self.doc.borrow();
+            match d.sel {
+                Some(s) => Some(s.normalized()),
+                None => d.hover.as_ref().map(|r| (r.x0, r.y0, r.x1, r.y1)),
+            }
+        };
+        for w in &self.wins {
+            let Some((x0, y0, x1, y1)) = paint::annot_rect(live, w.rect) else {
+                if w.annot.is_visible() {
+                    w.annot.set_visible(false);
+                }
+                continue;
+            };
+            let (x, y) = (x0.round() as i32, y0.round() as i32);
+            let (bw, bh) = ((x1 - x0).round() as i32, (y1 - y0).round() as i32);
+            if bw <= 0 || bh <= 0 {
+                if w.annot.is_visible() {
+                    w.annot.set_visible(false);
+                }
+                continue;
+            }
+            let view = (w.rect.0 + x0.round(), w.rect.1 + y0.round());
+            if w.view.get() != view {
+                w.view.set(view);
+                // 平移变了，整层内容都要跟着挪
+                w.annot.queue_draw();
+            }
+            if w.annot.margin_start() != x {
+                w.annot.set_margin_start(x);
+            }
+            if w.annot.margin_top() != y {
+                w.annot.set_margin_top(y);
+            }
+            if w.annot.width_request() != bw || w.annot.height_request() != bh {
+                w.annot.set_size_request(bw, bh);
+            }
+            if !w.annot.is_visible() {
+                w.annot.set_visible(true);
+            }
+        }
+    }
+
     /// 重绘：只刷「新旧脏区」碰到的屏，跨屏拖动时相关的那几块一起刷
     fn redraw(&mut self) {
         self.sync_dim();
+        self.sync_annot();
         let next = self.dirty_rect();
         let dirty = match (self.dirty, next) {
             (Some(a), Some(b)) => Some(union(a, b)),
@@ -862,7 +925,7 @@ impl Session {
         self.dirty = next;
         for w in &self.wins {
             if dirty.map(|d| intersect(d, w.rect).is_some()).unwrap_or(true) {
-                w.area.queue_draw();
+                w.annot.queue_draw();
             }
         }
     }
@@ -900,7 +963,7 @@ impl Session {
             w.ui.sync_tool(tool);
             let on_sel = owner == Some(w.idx) && sel.is_some() && !selecting;
             if let (true, Some(s)) = (on_sel, sel) {
-                let area = (f64::from(w.area.width()), f64::from(w.area.height()));
+                let area = (f64::from(w.screen.width()), f64::from(w.screen.height()));
                 let r = s.normalized();
                 // 工具条是窗口里的控件，摆位得用本屏局部坐标
                 let local = (
@@ -923,7 +986,7 @@ impl Session {
                 Tool::Text => "text",
                 _ => "crosshair",
             };
-            w.area.set_cursor_from_name(Some(cursor));
+            w.screen.set_cursor_from_name(Some(cursor));
         }
     }
 
@@ -1092,8 +1155,8 @@ fn list_monitors(display: &gdk::Display) -> Vec<gdk::Monitor> {
 
 /// 把文字输入框就地摆到落点上，返回实际用的落点
 fn put_entry(w: &Win, x: f64, y: f64) -> (f64, f64) {
-    let area_w = f64::from(w.area.width());
-    let area_h = f64::from(w.area.height());
+    let area_w = f64::from(w.screen.width());
+    let area_h = f64::from(w.screen.height());
     // 贴边时往回收，别把输入框挤出屏
     let ax = x.clamp(0.0, (area_w - 40.0).max(0.0));
     let ay = y.clamp(0.0, (area_h - 30.0).max(0.0));
