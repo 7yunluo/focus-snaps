@@ -36,6 +36,26 @@ pub fn surface_from_bgra(width: u32, height: u32, pixels: &[u8]) -> Result<cairo
     Ok(surface)
 }
 
+/// 抓屏的 BGRA 像素直接包成 GPU 纹理
+///
+/// 绕道 cairo 再转纹理要多拷一份整屏数据（5120x2160 就是 44 MB），
+/// 这里就地换一下 R/B 顺序就够了。
+pub fn texture_from_bgra(width: u32, height: u32, pixels: &[u8]) -> gdk::Texture {
+    let mut rgba = pixels.to_vec();
+    for px in rgba.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    let bytes = glib::Bytes::from(&rgba);
+    gdk::MemoryTexture::new(
+        width as i32,
+        height as i32,
+        gdk::MemoryFormat::R8g8b8a8,
+        &bytes,
+        width as usize * 4,
+    )
+    .upcast()
+}
+
 /// 渲染选区：跨屏时把各屏画面在物理像素上拼成一张整图
 pub fn render_selection(doc: &mut Doc) -> Result<cairo::ImageSurface, String> {
     let sel = doc.sel.ok_or("还没有选区")?.normalized();

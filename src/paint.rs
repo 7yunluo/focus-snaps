@@ -14,6 +14,9 @@ pub const HANDLE_HIT: f64 = 9.0;
 
 /// 画一个显示器的整块浮层，area 是窗口的实际逻辑尺寸
 ///
+/// 屏幕画面本身不在这里贴：它在下层由 GtkPicture 直接合成，纹理只上传一次；
+/// 这里只画压暗、标注、边框这些随交互变化的东西。
+///
 /// 选区、标注都存在全局逻辑坐标里，各屏把自己跟选区求交集的那一段画出来，
 /// 多画的落在 surface 外被合成器裁掉，视觉上就拼成一块连续的浮层。
 pub fn paint(
@@ -24,21 +27,14 @@ pub fn paint(
     preview: Option<(f64, f64, &str)>,
 ) {
     // 本屏的参数先拷出来，后面要可变借用文档
-    let (origin, size, sx, sy, phys, out_rect) = match doc.outs.get(out_idx) {
-        Some(o) => (o.origin, o.size, o.sx, o.sy, o.phys.clone(), o.rect()),
+    let (origin, size, sx, sy, out_rect) = match doc.outs.get(out_idx) {
+        Some(o) => (o.origin, o.size, o.sx, o.sy, o.rect()),
         None => return,
     };
     let sel = doc.sel.map(|s| s.normalized());
     let hover = doc.hover.as_ref().map(|r| (r.x0, r.y0, r.x1, r.y1));
     // 尺寸徽标只在选区左上角所在的那块屏上画
     let owner = sel.map(|s| doc.out_at(s.0, s.1)) == Some(Some(out_idx));
-
-    // 画面按物理分辨率 1:1 贴到设备像素，避免二次采样发虚
-    let _ = cr.save();
-    cr.scale(1.0 / sx, 1.0 / sy);
-    let _ = cr.set_source_surface(&phys, 0.0, 0.0);
-    let _ = cr.paint();
-    let _ = cr.restore();
 
     let Doc {
         outs,
@@ -558,6 +554,9 @@ mod tests {
         let mut target = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).unwrap();
         {
             let cr = cairo::Context::new(&target).unwrap();
+            // 下层画面如今由 GtkPicture 合成，这里铺一层同样的浅灰当作它
+            cr.set_source_rgb(200.0 / 255.0, 200.0 / 255.0, 200.0 / 255.0);
+            let _ = cr.paint();
             paint(&cr, doc, idx, (w as f64, h as f64), None);
             let _ = cr.show_page();
         }

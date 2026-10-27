@@ -189,6 +189,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
 
     let metas = capture::probe().unwrap_or_default();
     let mut outs = Vec::new();
+    let mut textures: Vec<gdk::Texture> = Vec::new();
     let mut picks: Vec<gdk::Monitor> = Vec::new();
 
     for m in monitors {
@@ -217,6 +218,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
                 continue;
             }
         };
+        let texture = export::texture_from_bgra(cap.width, cap.height, &cap.pixels);
         let mut phys = export::surface_from_bgra(cap.width, cap.height, &cap.pixels)?;
         let sx = cap.width as f64 / geo.width() as f64;
         let sy = cap.height as f64 / geo.height() as f64;
@@ -235,6 +237,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
             r.y1 += origin.1;
         }
         outs.push(OutputLayer::new(origin, size, sx, sy, phys, win_rects));
+        textures.push(texture);
         picks.push(m);
     }
 
@@ -257,7 +260,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
     }));
 
     for (idx, monitor) in picks.iter().enumerate() {
-        let win = make_window(app, &sess, idx, monitor);
+        let win = make_window(app, &sess, idx, monitor, textures.get(idx).cloned());
         sess.borrow_mut().wins.push(Rc::new(win));
     }
 
@@ -478,6 +481,7 @@ fn make_window(
     sess: &SessionRef,
     idx: usize,
     monitor: &gdk::Monitor,
+    texture: Option<gdk::Texture>,
 ) -> Win {
     let (origin, rect) = {
         let s = sess.borrow();
@@ -493,13 +497,27 @@ fn make_window(
         .build();
     window.set_title(Some("FocusSnapS"));
 
+    // 屏幕画面单独放一层 GtkPicture：纹理只在启动时上传一次，之后每帧由
+    // GPU 合成。以前是每帧用 cairo 把整屏图像重画一遍（5120x2160 就是 44 MB），
+    // 负载一高就掉帧。
+    let picture = gtk::Picture::new();
+    picture.set_hexpand(true);
+    picture.set_vexpand(true);
+    // 纹理就是物理分辨率，按需拉满整块屏，避免二次采样发虚
+    picture.set_content_fit(gtk::ContentFit::Fill);
+    if let Some(texture) = texture {
+        picture.set_paintable(Some(&texture));
+    }
+
     let area = gtk::DrawingArea::new();
     area.set_hexpand(true);
     area.set_vexpand(true);
     area.set_cursor_from_name(Some("crosshair"));
 
     let overlay = gtk::Overlay::new();
-    overlay.set_child(Some(&area));
+    overlay.set_child(Some(&picture));
+    overlay.add_overlay(&area);
+    overlay.set_measure_overlay(&area, false);
 
     let actions = Actions {
         on_copy: {
