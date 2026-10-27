@@ -299,3 +299,38 @@ GPU 回读要 **3.3 秒**，比等后台那一秒糟得多。主线程上永远�
 标注层每帧都要把整层当纹理重传一遍，所以层越小每帧申请越少：现在只有上方留
 34 像素（放尺寸徽标），其余三边留 10（手柄伸出去的量）；徽标放不下时会挪到
 选区下方，那时候是下方多留 34。
+
+## 高负载下「主线程空转几百毫秒」的真凶：THP 直接内存规整
+
+前面几节量到「状态 R、用户态 0 ms、内核态 300 ms、缺页 0 次」。有 sudo 之后直接
+读 `/proc/<pid>/task/<pid>/stack`（密集采样），空转时的内核栈是这样的：
+
+```
+preempt_schedule_thunk -> try_to_migrate_one -> __rmap_walk_file -> migrate_pages_batch
+preempt_schedule_thunk -> kvm_mmu_notifier_invalidate_range_start [kvm]
+```
+
+也就是我们的线程在做一次内存分配时，走进了**直接内存规整（direct compaction）**：
+为了拼出一个透明大页，内核在我们的上下文里迁移物理页，每迁移一页还要走 rmap 并
+通知 mmu_notifier（这台机器上跑着 KVM 的 Win10 虚拟机，那一环更贵）。整条路都在
+内核态、都在跑、又不产生缺页——和实测的现场完全对得上。
+
+A/B（每次 3~4 轮 ×10 秒，跑 `pnpm vite build` 当负载）：
+
+| `/sys/kernel/mm/transparent_hugepage/defrag` | 主线程卡住 | 期间 `compact_stall` |
+|---|---|---|
+| `always` | 2~3 次/轮 | +363 ~ +793 |
+| `defer+madvise` | 3 次 | +137 |
+| `never` | **0 次**（4 轮共 1 次） | **+1** |
+
+所以：**这不是应用的问题**，`defrag=always` 让每一个会分配内存的线程都可能被拖进
+页迁移里，谁分配得勤谁挨打。这台机器的 `compact_stall` 累计六万多、`compact_fail`
+五万多（几乎都在白干）。
+
+处理办法（系统侧，`/etc` 里持久化或换 `defrag=never`）：
+
+```sh
+echo never | sudo tee /sys/kernel/mm/transparent_hugepage/defrag
+```
+
+应用侧能做的只是少挨打：见上一节（不常驻像素、不在主线程做 GPU 回读、标注层收窄）。
