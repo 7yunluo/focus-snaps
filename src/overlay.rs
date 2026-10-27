@@ -109,6 +109,7 @@ fn acquire_lock() -> bool {
 }
 
 pub fn run(opts: Options) -> i32 {
+    gtk::Window::set_default_icon_name("focus-snaps");
     if !acquire_lock() {
         eprintln!("已经有一个截图浮层开着");
         crate::export::notify("FocusSnapS", "已经有一个截图浮层开着");

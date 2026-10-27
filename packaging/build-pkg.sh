@@ -9,7 +9,7 @@ mkdir -p "$TMP/$NAME"
 mkdir -p "$TMP/$NAME/packaging"
 rsync -a --exclude target --exclude .git \
   Cargo.toml Cargo.lock README.md LICENSE src "$TMP/$NAME/"
-rsync -a packaging/focus-snaps.desktop "$TMP/$NAME/packaging/"
+rsync -a packaging/focus-snaps.desktop packaging/focus-snaps.svg packaging/focus-snaps-256.png "$TMP/$NAME/packaging/"
 tar -C "$TMP" -czf "packaging/$NAME.tar.gz" "$NAME"
 rm -rf "$TMP"
 echo "已生成 packaging/$NAME.tar.gz"

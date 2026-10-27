@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect x="0" y="0" width="128" height="128" rx="28" ry="28" fill="#1f1a17"/>
+  <!-- 选区取景框：四角括号 -->
+  <g fill="none" stroke="#f2ece6" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M24 44 V24 H44"/>
+    <path d="M84 24 H104 V44"/>
+    <path d="M104 84 V104 H84"/>
+    <path d="M44 104 H24 V84"/>
+  </g>
+  <!-- 一笔标注：从框内斜着画出去 -->
+  <path d="M44 88 L87 45" fill="none" stroke="#ffb88c" stroke-width="12" stroke-linecap="round"/>
+  <circle cx="90" cy="42" r="8" fill="#ffb88c"/>
+</svg>

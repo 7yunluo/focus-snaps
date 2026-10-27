@@ -1,6 +1,6 @@
 # FocusSnapS 的 Arch 包，源码来自本地打好的 tarball（见 build-pkg.sh）
 pkgname=focus-snaps
-pkgver=0.4.0
+pkgver=0.4.1
 pkgrel=1
 pkgdesc="Wayland 截图与标注工具（多显示器 / 分数缩放 / 窗口选择）"
 arch=('x86_64')
@@ -24,6 +24,10 @@ package() {
   install -Dm755 target/release/FocusSnapS "$pkgdir/usr/bin/FocusSnapS"
   install -Dm644 packaging/focus-snaps.desktop \
     "$pkgdir/usr/share/applications/focus-snaps.desktop"
+  install -Dm644 packaging/focus-snaps.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/focus-snaps.svg"
+  install -Dm644 packaging/focus-snaps-256.png \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/focus-snaps.png"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
