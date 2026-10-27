@@ -287,14 +287,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
 
     // 只看一屏时盯着焦点，被切走就抢回来，避免键漏给别的应用
     if let Some(only) = opts.only.clone() {
-        glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
-            if let Some(cur) = crate::niri::focused_output() {
-                if cur != only {
-                    crate::niri::focus_output(&only);
-                }
-            }
-            glib::ControlFlow::Continue
-        });
+        crate::niri::keep_focus_in_background(only);
     }
 
     sess.borrow_mut().sync_ui();

@@ -86,6 +86,22 @@ pub fn focused_output() -> Option<String> {
     Some(v["name"].as_str()?.to_string())
 }
 
+/// 在后台盯着焦点显示器，被切到别处就抢回来
+///
+/// 每次轮询都要 fork/exec 一次 `niri msg`（实测 4 ms 上下，负载高时更久），
+/// 放在主线程上等于每 500 ms 吃掉一帧的预算，整段必须丢到独立线程里。
+/// 进程退出时线程跟着没，不需要收拾。
+pub fn keep_focus_in_background(want: String) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if let Some(cur) = focused_output() {
+            if cur != want {
+                focus_output(&want);
+            }
+        }
+    });
+}
+
 /// 把键盘焦点切到指定显示器
 pub fn focus_output(name: &str) -> bool {
     Command::new("niri")
