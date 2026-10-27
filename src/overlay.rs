@@ -201,6 +201,8 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
     let mut textures: Vec<gdk::Texture> = Vec::new();
     let mut picks: Vec<gdk::Monitor> = Vec::new();
 
+    // 先挑出要抓的屏
+    let mut targets: Vec<(String, gdk::Monitor, gdk::Rectangle)> = Vec::new();
     for m in monitors {
         let Some(connector) = m.connector().map(|s| s.to_string()) else {
             eprintln!("跳过无法识别名称的显示器");
@@ -220,15 +222,46 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
             eprintln!("显示器 {connector} 逻辑尺寸异常，跳过");
             continue;
         }
-        let cap = match capture::capture_output(&connector, opts.cursor) {
-            Ok(c) => c,
-            Err(e) => {
+        targets.push((connector, m, geo));
+    }
+
+    // 所有屏同时抓：每块屏都要各自走一遍 Wayland 连接与抓屏往返，
+    // 串行做的话多屏启动时间是相加的
+    let cursor = opts.cursor;
+    let pending: Vec<_> = targets
+        .iter()
+        .map(|(connector, _, _)| {
+            let name = connector.clone();
+            std::thread::spawn(move || {
+                let cap = capture::capture_output(&name, cursor).map(|mut c| {
+                    // 换通道是整屏扫一遍的活，跟抓屏一起在后台做掉
+                    export::swizzle_rgba(&mut c.pixels);
+                    c
+                });
+                (name, cap)
+            })
+        })
+        .collect();
+
+    for ((connector, m, geo), handle) in targets.into_iter().zip(pending) {
+        let mut cap = match handle.join() {
+            Ok((_, Ok(c))) => c,
+            Ok((_, Err(e))) => {
                 eprintln!("抓取显示器 {connector} 失败: {e}");
                 continue;
             }
+            Err(_) => {
+                eprintln!("抓取显示器 {connector} 的线程挂了");
+                continue;
+            }
         };
-        let texture = export::texture_from_bgra(cap.width, cap.height, &cap.pixels);
-        let mut phys = export::surface_from_bgra(cap.width, cap.height, &cap.pixels)?;
+        let mut phys = export::surface_from_rgba(cap.width, cap.height, &cap.pixels)?;
+        // 像素直接交给纹理，省掉一次整屏拷贝
+        let texture = export::texture_from_rgba_owned(
+            std::mem::take(&mut cap.pixels),
+            cap.width as i32,
+            cap.height as i32,
+        );
         let sx = cap.width as f64 / geo.width() as f64;
         let sy = cap.height as f64 / geo.height() as f64;
         if (sx / sy - 1.0).abs() > 0.02 {
@@ -1118,7 +1151,7 @@ impl Session {
                 .first()
                 .and_then(|w| w.clone().downcast::<gtk::ApplicationWindow>().ok())
                 .map(|w| w.clipboard());
-            match (clipboard, export::texture_from_rgba(&rgba, w, h)) {
+            match (clipboard, export::texture_from_rgba(&rgba[..], w, h)) {
                 (Some(cb), Ok(texture)) => cb.set_texture(&texture),
                 (Some(_), Err(e)) => eprintln!("复制失败: {e}"),
                 (None, _) => eprintln!("复制失败: 没有可用窗口"),

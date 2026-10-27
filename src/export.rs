@@ -36,24 +36,13 @@ pub fn surface_from_bgra(width: u32, height: u32, pixels: &[u8]) -> Result<cairo
     Ok(surface)
 }
 
-/// 抓屏的 BGRA 像素直接包成 GPU 纹理
+/// 把抓屏的 BGRA 像素就地换成 RGBA
 ///
-/// 绕道 cairo 再转纹理要多拷一份整屏数据（5120x2160 就是 44 MB），
-/// 这里就地换一下 R/B 顺序就够了。
-pub fn texture_from_bgra(width: u32, height: u32, pixels: &[u8]) -> gdk::Texture {
-    let mut rgba = pixels.to_vec();
-    for px in rgba.chunks_exact_mut(4) {
+/// 整屏扫一遍的事，跟抓屏一起放后台线程做，别占主线程。
+pub fn swizzle_rgba(pixels: &mut [u8]) {
+    for px in pixels.chunks_exact_mut(4) {
         px.swap(0, 2);
     }
-    let bytes = glib::Bytes::from(&rgba);
-    gdk::MemoryTexture::new(
-        width as i32,
-        height as i32,
-        gdk::MemoryFormat::R8g8b8a8,
-        &bytes,
-        width as usize * 4,
-    )
-    .upcast()
 }
 
 /// 渲染选区：跨屏时把各屏画面在物理像素上拼成一张整图
@@ -116,7 +105,6 @@ pub fn render_selection(doc: &mut Doc) -> Result<cairo::ImageSurface, String> {
     Ok(surface)
 }
 
-/// 画布转 RGBA8 字节
 /// 画布转 RGBA 像素
 ///
 /// 通道顺序要换一下（cairo 的 ARGB32 在内存里是 BGRX）。按 4 字节一组整块处理，
@@ -158,15 +146,49 @@ pub fn encode_png(surface: &mut cairo::ImageSurface) -> Result<Vec<u8>, String> 
 
 /// RGBA 像素转剪贴板纹理
 pub fn texture_from_rgba(rgba: &[u8], w: i32, h: i32) -> Result<gdk::Texture, String> {
-    let bytes = glib::Bytes::from(rgba);
-    Ok(gdk::MemoryTexture::new(
+    Ok(texture_from_rgba_owned(rgba.to_vec(), w, h))
+}
+
+/// 同上，但接管这块像素的所有权，省掉一次整屏拷贝
+pub fn texture_from_rgba_owned(rgba: Vec<u8>, w: i32, h: i32) -> gdk::Texture {
+    let bytes = glib::Bytes::from_owned(rgba);
+    gdk::MemoryTexture::new(
         w,
         h,
         gdk::MemoryFormat::R8g8b8a8,
         &bytes,
         (w as usize) * 4,
     )
-    .upcast())
+    .upcast()
+}
+
+/// 把 RGBA 像素包成画布
+///
+/// cairo 的 ARGB32 在内存里是 BGRX，拷进去的时候顺手换个通道。
+pub fn surface_from_rgba(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<cairo::ImageSurface, String> {
+    let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width as i32, height as i32)
+        .map_err(|e| format!("创建画布失败: {e}"))?;
+    {
+        let stride = surface.stride() as usize;
+        let row = width as usize * 4;
+        let mut data = surface.data().map_err(|e| format!("锁定画布失败: {e}"))?;
+        for y in 0..height as usize {
+            let src = &pixels[y * row..y * row + row];
+            let dst = &mut data[y * stride..y * stride + row];
+            for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = s[3];
+            }
+        }
+    }
+    surface.mark_dirty();
+    Ok(surface)
 }
 
 fn stamp() -> String {
