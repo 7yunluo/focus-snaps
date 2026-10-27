@@ -147,17 +147,17 @@ fn watch_stalls() {
     let tid = unsafe { libc::gettid() };
     std::thread::spawn(move || {
         let mut last_beat = 0;
-        let mut last_cpu = 0;
+        let mut last_cpu = (0u64, 0u64, 0u64, 0u64);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(300));
             let beat = BEAT.load(Ordering::Relaxed);
             if beat != last_beat {
                 last_beat = beat;
-                last_cpu = thread_cpu_ticks(tid).unwrap_or(0);
+                last_cpu = thread_stat(tid).unwrap_or((0, 0, 0, 0));
                 continue;
             }
             // 主线程 300 ms 没心跳了：把现场打出来
-            let cpu = thread_cpu_ticks(tid).unwrap_or(0);
+            let cpu = thread_stat(tid).unwrap_or((0, 0, 0, 0));
             let state = proc_field("/proc/self/stat", 2).unwrap_or_default();
             let wchan = std::fs::read_to_string(format!("/proc/self/task/{tid}/wchan"))
                 .map(|v| v.trim().to_string())
@@ -171,8 +171,11 @@ fn watch_stalls() {
                 })
                 .unwrap_or_default();
             trace(&format!(
-                "主线程停住了：状态 {state}，卡在 {wchan}，这 300 ms 烧了 {} ms CPU，RSS {rss} kB，最后在「{}」",
-                (cpu.saturating_sub(last_cpu)) * 10,
+                "主线程停住了：状态 {state}，卡在 {wchan}，这 300 ms 用户态 {} ms + 内核态 {} ms，缺页 {} 次（主要 {}），RSS {rss} kB，最后在「{}」",
+                cpu.0.saturating_sub(last_cpu.0) * 10,
+                cpu.1.saturating_sub(last_cpu.1) * 10,
+                cpu.2.saturating_sub(last_cpu.2),
+                cpu.3.saturating_sub(last_cpu.3),
                 phase_name(PHASE.load(std::sync::atomic::Ordering::Relaxed))
             ));
             last_cpu = cpu;
@@ -180,16 +183,19 @@ fn watch_stalls() {
     });
 }
 
-/// 某个线程累计的 CPU 时间（单位 jiffies，一般 10 ms 一个）
-fn thread_cpu_ticks(tid: i32) -> Option<u64> {
+/// 某个线程的现场：(用户态 CPU, 内核态 CPU, 次要缺页, 主要缺页)，单位都是 jiffies / 次
+fn thread_stat(tid: i32) -> Option<(u64, u64, u64, u64)> {
     let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
     // 第 2 个字段是线程名，里面可能有空格和括号，从右往左数才稳
     let rest = stat.rsplit_once(')')?.1;
     let f: Vec<&str> = rest.split_whitespace().collect();
-    // utime、stime 在整行里是第 14、15 个字段；括号之后从 state（第 3 个）开始
+    // utime、stime 是整行的第 14、15 个字段，括号之后从 state（第 3 个）开始；
+    // minflt/majflt 是第 10、12 个
     let utime: u64 = f.get(11)?.parse().ok()?;
     let stime: u64 = f.get(12)?.parse().ok()?;
-    Some(utime + stime)
+    let minflt: u64 = f.get(7)?.parse().ok()?;
+    let majflt: u64 = f.get(9)?.parse().ok()?;
+    Some((utime, stime, minflt, majflt))
 }
 
 /// 读 /proc 里某个文件的第 n 个空白分隔字段（从 0 开始）
