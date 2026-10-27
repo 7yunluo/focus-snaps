@@ -112,3 +112,44 @@ cd /tmp/fs-old && CARGO_TARGET_DIR=/tmp/fs-old-target cargo build --release
 ```
 
 基准钩子（`FOCUSSNAPS_BENCH`）在两个树里都加上，跑同一组参数才可比。
+
+## 零拷贝抓屏（dmabuf）与它的坑
+
+`zwlr_screencopy` 走 wl_shm 时，合成器要把整屏画面从显存读回共享内存
+（DP-1 是 44 MB），GPU 忙的时候这一步能卡到 1.5~3 s，`FOCUSSNAPS_TRACE=1`
+一眼就能看出来（`抓屏完` 那一行）。
+
+零拷贝那条路照 `../farwing/src/platform/linux/capture/dmabuf.rs`：
+DRM dumb buffer（`CREATE_DUMB` + `HANDLE_TO_FD`）+ `zwp_linux_dmabuf_v1`
+的 `create_immed`，再用 `gdk::DmabufTextureBuilder` 直接导成 `GdkTexture`。
+实测抓屏 1500 ms → 20~40 ms。
+
+几个坑：
+
+- **dumb buffer 只能在 `/dev/dri/cardN` 上分配**，`renderD*` 会 EACCES
+- **mmap 读显存很慢**：驱动给的是 write-combined 映射，44 MB 读下来能到
+  1 s 量级。所以像素读取要放在独立线程，别占主线程，也别拦着画面出现；
+  只想要「显示」的话根本不需要 CPU 像素
+- **转过的屏走不了这条路**（dma-buf 里是扫描方向），DP-3 是 90°，自动退回共享内存
+- 抓屏出来的 alpha 都是 255，纹理按 `B8G8R8A8_PREMULTIPLIED` 处理与直通一致
+
+对照验证：
+
+```sh
+# 零拷贝 vs 共享内存，导出的 PNG 应当逐像素一致
+FOCUSSNAPS_DIR=/tmp/d1 FOCUSSNAPS_TEST_SELECT="1500,300,600,400" \
+  FOCUSSNAPS_TEST_SAVE="@" ./target/release/FocusSnapS -o DP-1
+FOCUSSNAPS_NO_DMABUF=1 FOCUSSNAPS_DIR=/tmp/d2 FOCUSSNAPS_TEST_SELECT="1500,300,600,400" \
+  FOCUSSNAPS_TEST_SAVE="@" ./target/release/FocusSnapS -o DP-1
+```
+
+两次必须**紧挨着跑**：桌面内容（时钟、日志滚动）一变，比值就没意义了。
+
+## 浮层先出现、画面后补
+
+抓屏慢的时候不能拦着浮层出现。现在 `build()` 只按显示器位置建图层并立刻
+present（本机 +22 ms），画面由后台线程抓到一块补一块。没画面之前窗口带
+`.fs-pending`（透明），桌面透出来只叠一层压暗。
+
+导出要等画面齐（`all_ready()` 看的是画布，不只是纹理），这期间按下的
+复制/保存会记在 `Session.pending` 里，最后一块屏补齐后自动执行。
