@@ -386,21 +386,46 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
             let start = std::time::Instant::now();
             let done = std::cell::Cell::new(0u32);
             let quit = sess.clone();
+            // 拖拽模式下带着整个选区满屏跑，位置每帧都在变
+            let pos = std::cell::Cell::new((0.0f64, 0.0f64));
+            let dir = std::cell::Cell::new((1.0f64, 1.0f64));
+            let dragging = std::cell::Cell::new(0usize);
             w.annot.add_tick_callback(move |w, _clock| {
                 if drag {
-                    for _ in 0..steps {
-                        if let Ok(mut s) = quit.try_borrow_mut() {
-                            let bbox = s.doc.borrow().bbox();
-                            let cur = s.doc.borrow().sel;
-                            if let Some(mut sel) = cur {
-                                let step = if (done.get() / 30) % 2 == 0 { 0.5 } else { -0.5 };
-                                sel.x1 = (sel.x1 + step).clamp(sel.x0 + 40.0, bbox.2);
-                                sel.y1 = (sel.y1 + step).clamp(sel.y0 + 40.0, bbox.3);
-                                s.doc.borrow_mut().sel = Some(sel);
-                                s.redraw();
+                    if let Ok(mut s) = quit.try_borrow_mut() {
+                        let bbox = s.doc.borrow().bbox();
+                        let cur = s.doc.borrow().sel.map(|v| v.normalized());
+                        if let Some(r) = cur {
+                            let (sw, sh) = (r.2 - r.0, r.3 - r.1);
+                            if done.get() == 0 {
+                                // 从选区中间按下去，走真实的「移动选区」拖动
+                                let idx = s.doc.borrow().sel_output().unwrap_or(0);
+                                dragging.set(idx);
+                                pos.set((r.0, r.1));
+                                on_drag_begin(&mut s, idx, r.0 + sw / 2.0, r.1 + sh / 2.0);
+                            } else {
+                                let (mut x, mut y) = pos.get();
+                                let (mut dx, mut dy) = dir.get();
+                                x += dx * 24.0;
+                                y += dy * 24.0;
+                                if x <= bbox.0 || x >= bbox.2 - sw {
+                                    x = x.clamp(bbox.0, (bbox.2 - sw).max(bbox.0));
+                                    dx = -dx;
+                                }
+                                if y <= bbox.1 || y >= bbox.3 - sh {
+                                    y = y.clamp(bbox.1, (bbox.3 - sh).max(bbox.1));
+                                    dy = -dy;
+                                }
+                                pos.set((x, y));
+                                dir.set((dx, dy));
+                                // 一帧里塞多个指针事件，测合并
+                                for _ in 0..steps {
+                                    s.queue_pointer(dragging.get(), x + sw / 2.0, y + sh / 2.0);
+                                }
                             }
                         }
                     }
+                    schedule_pointer(&quit);
                 }
                 w.queue_draw();
                 let n = done.get() + 1;
