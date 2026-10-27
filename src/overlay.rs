@@ -406,6 +406,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
                                 dragging.set(idx);
                                 pos.set((r.0, r.1));
                                 on_drag_begin(&mut s, idx, r.0 + sw / 2.0, r.1 + sh / 2.0);
+                                s.sync_ui();
                             } else {
                                 let (mut x, mut y) = pos.get();
                                 let (mut dx, mut dy) = dir.get();
@@ -1056,6 +1057,9 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
                 motion.set_propagation_phase(gtk::PropagationPhase::None);
                 let mut s = sess.borrow_mut();
                 on_drag_begin(&mut s, idx, x + origin.0, y + origin.1);
+                // 框选/缩放/移动期间工具条要收起来（sync_ui 里判的 selecting），
+                // 不在这儿同步一次的话它会一直停在原处，看着像没跟着走
+                s.sync_ui();
                 s.redraw();
             }
         });
