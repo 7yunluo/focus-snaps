@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=FocusSnapS
+Comment=截图并标注（多显示器 / 分数缩放 / 窗口选择）
+Exec=FocusSnapS
+Terminal=false
+Categories=Utility;Graphics;
+Keywords=screenshot;capture;annotate;
