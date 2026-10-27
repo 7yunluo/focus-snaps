@@ -158,6 +158,8 @@ pub struct OutputLayer {
     pub phys: cairo::ImageSurface,
     /// 这一屏上识别出来的窗口矩形（全局逻辑坐标）
     pub windows: Vec<Rect>,
+    /// 打码用的块平均小图，第一次用到时才建（见 paint::mosaic_image）
+    pub mosaic: Option<cairo::ImageSurface>,
 }
 
 impl OutputLayer {
@@ -176,6 +178,7 @@ impl OutputLayer {
             sy,
             phys,
             windows,
+            mosaic: None,
         }
     }
 

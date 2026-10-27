@@ -467,16 +467,15 @@ pub fn draw_stroke(cr: &cairo::Context, outs: &mut [OutputLayer], s: &Stroke) {
     }
 }
 
-/// 区域打码：从原画面按块取平均色再填实心方块
+/// 打码块的大小（逻辑像素）
+const MOSAIC_BLOCK: f64 = 12.0;
+
+/// 区域打码：从预计算好的块平均图上贴一块
 ///
-/// 打码块跨越屏边界时，按屏切开分别取各自画面的像素。
+/// 块平均图是整屏一次性算出来的（mosaic_image），每帧只是把它按块贴在选区里，
+/// 不再每帧去扫原画面的像素。
 fn paint_mosaic(cr: &cairo::Context, outs: &mut [OutputLayer], a: (f64, f64), b: (f64, f64)) {
-    let want = (
-        a.0.min(b.0),
-        a.1.min(b.1),
-        a.0.max(b.0),
-        a.1.max(b.1),
-    );
+    let want = (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1));
     for out in outs.iter_mut() {
         if let Some(r) = intersect(want, out.rect()) {
             mosaic_piece(cr, out, r);
@@ -484,69 +483,95 @@ fn paint_mosaic(cr: &cairo::Context, outs: &mut [OutputLayer], a: (f64, f64), b:
     }
 }
 
-/// 在一块屏的范围内打码，r 是全局逻辑坐标
+/// 在一部分屏幕上贴打码块，r 是全局逻辑坐标
 fn mosaic_piece(cr: &cairo::Context, out: &mut OutputLayer, r: Rect4) {
+    let origin = mosaic_origin(out);
+    let Some(img) = mosaic_image(out) else {
+        return;
+    };
+    let pat = cairo::SurfacePattern::create(&img);
+    // 一块一个纯色，必须按最近邻放大，不然块边缘会糊
+    pat.set_filter(cairo::Filter::Nearest);
+    let _ = cr.save();
+    cr.rectangle(r.0, r.1, r.2 - r.0, r.3 - r.1);
+    cr.clip();
+    cr.translate(origin.0, origin.1);
+    cr.scale(MOSAIC_BLOCK, MOSAIC_BLOCK);
+    let _ = cr.set_source(&pat);
+    let _ = cr.paint();
+    let _ = cr.restore();
+}
+
+/// 块平均图的左上角（全局逻辑坐标），对齐到全局的块网格
+///
+/// 网格按全局坐标对齐，跨屏打码时两边的纹路才是接得上的。
+pub fn mosaic_origin(out: &OutputLayer) -> (f64, f64) {
+    (
+        (out.origin.0 / MOSAIC_BLOCK).floor() * MOSAIC_BLOCK,
+        (out.origin.1 / MOSAIC_BLOCK).floor() * MOSAIC_BLOCK,
+    )
+}
+
+/// 取（必要时先算）本屏的块平均图
+///
+/// 每个像素代表 12x12 逻辑像素的平均色，sRGB 直通不进线性空间，贴上去跟原来的
+/// 逐块取平均等价。
+pub fn mosaic_image(out: &mut OutputLayer) -> Option<cairo::ImageSurface> {
+    if out.mosaic.is_none() {
+        out.mosaic = build_mosaic(out);
+    }
+    out.mosaic.clone()
+}
+
+fn build_mosaic(out: &mut OutputLayer) -> Option<cairo::ImageSurface> {
+    let (gx0, gy0) = mosaic_origin(out);
+    let (w, h) = out.size;
+    let cols = ((w + (out.origin.0 - gx0)) / MOSAIC_BLOCK).ceil() as i32;
+    let rows = ((h + (out.origin.1 - gy0)) / MOSAIC_BLOCK).ceil() as i32;
+    if cols <= 0 || rows <= 0 {
+        return None;
+    }
+    let mut img = cairo::ImageSurface::create(cairo::Format::ARgb32, cols, rows).ok()?;
     let stride = out.phys.stride() as usize;
     let (bw, bh) = (out.phys.width(), out.phys.height());
-    let (x0, y0, x1, y1) = r;
-    let data = match out.phys.data() {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-    // 块大小随缩放微调，观感上始终是 12 逻辑像素
-    let block = 12.0;
-    let step = 3usize;
-    // 块网格对齐到全局坐标，跨屏时纹路才是连续的
-    let gx0 = (x0 / block).floor() * block;
-    let gy0 = (y0 / block).floor() * block;
-
-    let _ = cr.save();
-    cr.rectangle(x0, y0, x1 - x0, y1 - y0);
-    cr.clip();
-    let mut y = gy0;
-    while y < y1 {
-        let mut x = gx0;
-        while x < x1 {
-            let px0 = ((x * out.sx).round() as i32).clamp(0, bw - 1) as usize;
-            let py0 = ((y * out.sy).round() as i32).clamp(0, bh - 1) as usize;
-            let px1 = (((x + block) * out.sx).round() as i32).clamp(px0 as i32 + 1, bw) as usize;
-            let py1 = (((y + block) * out.sy).round() as i32).clamp(py0 as i32 + 1, bh) as usize;
-            let (mut rs, mut gs, mut bs, mut n) = (0u64, 0u64, 0u64, 0u64);
-            let mut py = py0;
-            while py < py1 {
-                let row = py * stride;
-                let mut px = px0;
-                while px < px1 {
-                    let i = row + px * 4;
-                    if i + 3 < data.len() {
-                        bs += data[i] as u64;
-                        gs += data[i + 1] as u64;
-                        rs += data[i + 2] as u64;
+    {
+        let data = out.phys.data().ok()?;
+        let dst_stride = img.stride() as usize;
+        let mut dst = img.data().ok()?;
+        for j in 0..rows {
+            for i in 0..cols {
+                // 这一块覆盖的物理像素范围
+                let lx0 = gx0 + f64::from(i) * MOSAIC_BLOCK;
+                let ly0 = gy0 + f64::from(j) * MOSAIC_BLOCK;
+                let px0 = (((lx0 - out.origin.0) * out.sx).round().max(0.0) as i32).clamp(0, bw - 1);
+                let py0 = (((ly0 - out.origin.1) * out.sy).round().max(0.0) as i32).clamp(0, bh - 1);
+                let px1 = (((lx0 + MOSAIC_BLOCK - out.origin.0) * out.sx).round() as i32)
+                    .clamp(px0 + 1, bw) as usize;
+                let py1 = (((ly0 + MOSAIC_BLOCK - out.origin.1) * out.sy).round() as i32)
+                    .clamp(py0 + 1, bh) as usize;
+                let (mut rs, mut gs, mut bs, mut n) = (0u64, 0u64, 0u64, 0u64);
+                for py in py0 as usize..py1 {
+                    let row = py * stride;
+                    for px in px0 as usize..px1 {
+                        let k = row + px * 4;
+                        bs += data[k] as u64;
+                        gs += data[k + 1] as u64;
+                        rs += data[k + 2] as u64;
                         n += 1;
                     }
-                    px += step;
                 }
-                py += step;
+                let o = (j as usize) * dst_stride + (i as usize) * 4;
+                if n > 0 {
+                    dst[o] = (bs / n) as u8;
+                    dst[o + 1] = (gs / n) as u8;
+                    dst[o + 2] = (rs / n) as u8;
+                }
+                dst[o + 3] = 255;
             }
-            if n > 0 {
-                cr.set_source_rgb(
-                    rs as f64 / n as f64 / 255.0,
-                    gs as f64 / n as f64 / 255.0,
-                    bs as f64 / n as f64 / 255.0,
-                );
-                cr.rectangle(
-                    x,
-                    y,
-                    (x + block).min(x1) - x,
-                    (y + block).min(y1) - y,
-                );
-                let _ = cr.fill();
-            }
-            x += block;
         }
-        y += block;
     }
-    let _ = cr.restore();
+    img.mark_dirty();
+    Some(img)
 }
 
 #[cfg(test)]
@@ -739,6 +764,72 @@ mod tests {
         );
         // 全屏选区是退化的最坏情况，仍然是整屏
         assert_eq!(annot_rect(Some(out_rect), out_rect), Some(out_rect));
+    }
+
+    /// 造一块左黑右白的画面：分界在逻辑坐标 split 处
+    fn doc_half(w: i32, h: i32, split: f64) -> Doc {
+        let mut phys = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).unwrap();
+        {
+            let cr = cairo::Context::new(&phys).unwrap();
+            cr.set_source_rgb(0.0, 0.0, 0.0);
+            let _ = cr.paint();
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.rectangle(split, 0.0, f64::from(w) - split, f64::from(h));
+            let _ = cr.fill();
+        }
+        phys.mark_dirty();
+        Doc::new(
+            vec![OutputLayer::new(
+                (0.0, 0.0),
+                (f64::from(w), f64::from(h)),
+                1.0,
+                1.0,
+                phys,
+                Vec::new(),
+            )],
+            "/tmp".into(),
+        )
+    }
+
+    #[test]
+    fn mosaic_paints_block_averages() {
+        // 240 宽的画面，黑白分界在 x=120（正好是第 10 个块）
+        let mut doc = doc_half(240, 120, 120.0);
+        doc.sel = Some(Selection {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 240.0,
+            y1: 120.0,
+        });
+        doc.commit(Stroke {
+            tool: Tool::Mosaic,
+            color: (1.0, 0.0, 0.0),
+            width: 4.0,
+            points: vec![(0.0, 0.0), (240.0, 120.0)],
+            text: None,
+            number: None,
+            text_size: None,
+        });
+        let (data, w) = render_out(&mut doc, 0, 240, 120);
+        // 分界左边整块黑、右边整块白（避开左上角的尺寸徽标与边框手柄）
+        assert!(gray(&data, w, 13, 50) <= 8, "左块 {}", gray(&data, w, 13, 50));
+        assert!(gray(&data, w, 77, 50) <= 8, "左块 {}", gray(&data, w, 77, 50));
+        assert!(gray(&data, w, 200, 50) >= 247, "右块 {}", gray(&data, w, 200, 50));
+        // 同一个块里必须是一整片纯色，不能把原画面的像素露出来
+        assert_eq!(gray(&data, w, 13, 50), gray(&data, w, 23, 58), "同块内应同色");
+        assert_eq!(gray(&data, w, 194, 50), gray(&data, w, 205, 55), "同块内应同色");
+    }
+
+    #[test]
+    fn mosaic_grid_aligns_to_global_coordinates() {
+        // 屏从 x=1000 开始，块网格仍然对齐到全局的 12 的倍数，
+        // 这样跨屏打码时两边的纹路接得上
+        let mut doc = doc_half(240, 120, 120.0);
+        doc.outs[0].origin = (1000.0, 0.0);
+        let (gx0, gy0) = mosaic_origin(&doc.outs[0]);
+        assert_eq!(gx0 % 12.0, 0.0);
+        assert_eq!(gy0, 0.0);
+        assert_eq!(gx0, 996.0, "1000 向上取整到 12 的倍数");
     }
 
     #[test]
