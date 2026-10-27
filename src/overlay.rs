@@ -337,6 +337,37 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         w.window.present();
     }
 
+    // 性能回归用：连续重绘若干帧，打印实际帧间隔（FOCUSSNAPS_BENCH=帧数）
+    if let Ok(spec) = std::env::var("FOCUSSNAPS_BENCH") {
+        let frames: u32 = spec.parse().unwrap_or(120);
+        let sess = sess.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+            let Some(w) = sess.borrow().wins.first().cloned() else {
+                return;
+            };
+            let start = std::time::Instant::now();
+            let done = std::cell::Cell::new(0u32);
+            let quit = sess.clone();
+            w.annot.add_tick_callback(move |w, _clock| {
+                w.queue_draw();
+                let n = done.get() + 1;
+                done.set(n);
+                if n >= frames {
+                    let dt = start.elapsed().as_secs_f64();
+                    eprintln!(
+                        "BENCH {} 帧，{:.2} ms/帧（{:.0} fps）",
+                        frames,
+                        dt * 1000.0 / f64::from(frames),
+                        f64::from(frames) / dt
+                    );
+                    quit.borrow().app.quit();
+                    return glib::ControlFlow::Break;
+                }
+                glib::ControlFlow::Continue
+            });
+        });
+    }
+
     // 供自动化验证使用：启动后按预设区域选择并落盘
     if let Ok(spec) = std::env::var("FOCUSSNAPS_TEST_SELECT") {
         let sess = sess.clone();
