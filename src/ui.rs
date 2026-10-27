@@ -548,6 +548,8 @@ fn place_palette(palette: &gtk::Box, root: &gtk::Box, area: (f64, f64)) {
 /// 重新加载样式表（强调色跟随系统主题色）
 /// 样式表；强调色占位符在加载时替换
 const CSS: &str = "
+        /* 画面还没抓回来时窗口要透明，别用主题底色盖住桌面 */
+        .fs-pending { background-color: transparent; background-image: none; }
         /* 选区外压暗：四块实心矩形，由合成器填充 */
         .fs-dim { background-color: rgba(0, 0, 0, DIM_ALPHA); }
         @define-color fs_accent ACCENT;

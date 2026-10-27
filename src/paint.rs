@@ -532,10 +532,11 @@ fn build_mosaic(out: &mut OutputLayer) -> Option<cairo::ImageSurface> {
         return None;
     }
     let mut img = cairo::ImageSurface::create(cairo::Format::ARgb32, cols, rows).ok()?;
-    let stride = out.phys.stride() as usize;
-    let (bw, bh) = (out.phys.width(), out.phys.height());
+    let phys = out.phys.as_mut()?;
+    let stride = phys.stride() as usize;
+    let (bw, bh) = (phys.width(), phys.height());
     {
-        let data = out.phys.data().ok()?;
+        let data = phys.data().ok()?;
         let dst_stride = img.stride() as usize;
         let mut dst = img.data().ok()?;
         for j in 0..rows {

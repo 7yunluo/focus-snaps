@@ -83,13 +83,17 @@ pub fn render_selection(doc: &mut Doc) -> Result<cairo::ImageSurface, String> {
         // 底图：每块屏把自己那一段贴到画布上对应的位置
         for (i, r) in &hits {
             let o = &outs[*i];
+            // 画面还没抓回来的屏就没底图可贴，只剩标注
+            let Some(phys) = o.phys.as_ref() else {
+                continue;
+            };
             let px0 = ((r.0 - o.origin.0) * o.sx).round();
             let py0 = ((r.1 - o.origin.1) * o.sy).round();
             let _ = cr.save();
             cr.translate((r.0 - sel.0) * kx, (r.1 - sel.1) * ky);
             cr.scale(kx / o.sx, ky / o.sy);
             cr.translate(-px0, -py0);
-            let pat = cairo::SurfacePattern::create(&o.phys);
+            let pat = cairo::SurfacePattern::create(phys);
             pat.set_filter(cairo::Filter::Nearest);
             if cr.set_source(&pat).is_ok() {
                 let _ = cr.paint();

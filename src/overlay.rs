@@ -92,6 +92,15 @@ struct Session {
     last_click: Option<(std::time::Instant, (f64, f64))>,
     /// 已经甩给后台线程在导出，别再来一次
     exporting: bool,
+    /// 画面还没抓回来时按下的完成动作，等最后一块屏补上再执行
+    pending: Option<Export>,
+}
+
+/// 等画面就绪后再执行的完成动作
+#[derive(Clone, Copy)]
+enum Export {
+    Copy(Option<usize>),
+    Save(Option<usize>),
 }
 
 type SessionRef = Rc<RefCell<Session>>;
@@ -210,12 +219,12 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
 
     let metas = capture::probe().unwrap_or_default();
     trace("probe 完");
+    // 先把每块屏的图层按「已知的位置和逻辑尺寸」建出来，不等抓屏。
+    // 抓屏走的是合成器把整屏画面读回共享内存，GPU 忙的时候能卡到秒级；
+    // 拦在启动路径上就是「按了热键半天没反应」。画面由 apply_capture 后补。
     let mut outs = Vec::new();
-    let mut textures: Vec<gdk::Texture> = Vec::new();
     let mut picks: Vec<gdk::Monitor> = Vec::new();
-
-    // 先挑出要抓的屏
-    let mut targets: Vec<(String, gdk::Monitor, gdk::Rectangle)> = Vec::new();
+    let mut targets: Vec<(usize, String, gdk::Rectangle)> = Vec::new();
     for m in monitors {
         let Some(connector) = m.connector().map(|s| s.to_string()) else {
             eprintln!("跳过无法识别名称的显示器");
@@ -235,62 +244,11 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
             eprintln!("显示器 {connector} 逻辑尺寸异常，跳过");
             continue;
         }
-        targets.push((connector, m, geo));
-    }
-
-    // 所有屏同时抓：每块屏都要各自走一遍 Wayland 连接与抓屏往返，
-    // 串行做的话多屏启动时间是相加的
-    let cursor = opts.cursor;
-    let pending: Vec<_> = targets
-        .iter()
-        .map(|(connector, _, _)| {
-            let name = connector.clone();
-            std::thread::spawn(move || {
-                (name.clone(), capture::capture_output(&name, cursor))
-            })
-        })
-        .collect();
-
-    for ((connector, m, geo), handle) in targets.into_iter().zip(pending) {
-        let mut cap = match handle.join() {
-            Ok((_, Ok(c))) => c,
-            Ok((_, Err(e))) => {
-                eprintln!("抓取显示器 {connector} 失败: {e}");
-                continue;
-            }
-            Err(_) => {
-                eprintln!("抓取显示器 {connector} 的线程挂了");
-                continue;
-            }
-        };
-        trace(&format!("{connector} 抓屏完（{}x{}）", cap.width, cap.height));
-        let mut phys = export::surface_from_bgra(cap.width, cap.height, &cap.pixels)?;
-        trace(&format!("{connector} 画布就绪"));
-        // 抓屏缓冲直接交给纹理：GDK 认 BGRA，不用再整屏换一遍通道
-        let texture = export::texture_from_bgra_owned(
-            std::mem::take(&mut cap.pixels),
-            cap.width as i32,
-            cap.height as i32,
-        );
-        let sx = cap.width as f64 / geo.width() as f64;
-        let sy = cap.height as f64 / geo.height() as f64;
-        if (sx / sy - 1.0).abs() > 0.02 {
-            eprintln!("显示器 {connector} 横纵缩放不一致（{sx:.3} / {sy:.3}），画面可能轻微拉伸");
-        }
-        let size = (f64::from(geo.width()), f64::from(geo.height()));
         // GDK 给的显示器位置就是合成器的全局逻辑布局坐标，跨屏拼接全靠它
         let origin = (f64::from(geo.x()), f64::from(geo.y()));
-        let mut win_rects = crate::windows::detect_for_output(&connector, &mut phys, sx, sy, size);
-        trace(&format!("{connector} 窗口识别完（{} 块）", win_rects.len()));
-        // 窗口矩形跟着换成全局坐标，交互就只用一套坐标系
-        for r in win_rects.iter_mut() {
-            r.x0 += origin.0;
-            r.x1 += origin.0;
-            r.y0 += origin.1;
-            r.y1 += origin.1;
-        }
-        outs.push(OutputLayer::new(origin, size, sx, sy, phys, win_rects));
-        textures.push(texture);
+        let size = (f64::from(geo.width()), f64::from(geo.height()));
+        targets.push((outs.len(), connector, geo));
+        outs.push(OutputLayer::pending(origin, size));
         picks.push(m);
     }
 
@@ -311,10 +269,11 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         focused: None,
         last_click: None,
         exporting: false,
+        pending: None,
     }));
 
     for (idx, monitor) in picks.iter().enumerate() {
-        let win = make_window(app, &sess, idx, monitor, textures.get(idx).cloned());
+        let win = make_window(app, &sess, idx, monitor);
         sess.borrow_mut().wins.push(Rc::new(win));
     }
 
@@ -349,6 +308,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         w.window.present();
     }
     trace("present 完");
+    start_captures(&sess, targets, opts.cursor);
     {
         let ticks = std::cell::Cell::new(0u32);
         if let Some(w) = sess.borrow().wins.first() {
@@ -554,43 +514,148 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
                 }
             }
             if let Ok(path) = std::env::var("FOCUSSNAPS_TEST_SAVE") {
-                let sess2 = sess.clone();
-                glib::timeout_add_local_once(
-                    std::time::Duration::from_millis(250),
-                    move || {
-                        let mut s = sess2.borrow_mut();
-                        // 「@」表示走真实的保存路径（后台线程 + 默认目录），
-                        // 否则就按给定路径同步存一份，方便脚本直接拿文件
-                        if path == "@" {
-                            let idx = s.doc.borrow().sel_output();
-                            s.do_save(idx);
-                            return;
-                        }
-                        let s = s;
-                        let mut doc = s.doc.borrow_mut();
-                        match crate::export::render_selection(&mut doc).and_then(|mut surf| {
-                            crate::export::save_to_path(&mut surf, &path)
-                        }) {
-                            Ok(p) => println!("{}", p.display()),
-                            Err(e) => eprintln!("测试保存失败: {e}"),
-                        }
-                        s.app.quit();
-                    },
-                );
+                test_save(sess.clone(), path, 0);
             }
         });
     }
     Ok(())
 }
 
-/// 建一个显示器的浮层窗口
-fn make_window(
-    app: &gtk::Application,
+/// 自动化用：等画面都就绪了再存（最多等 5 秒）
+fn test_save(sess: SessionRef, path: String, tries: u32) {
+    glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
+        let sess2 = sess.clone();
+        let mut s = sess.borrow_mut();
+        if !s.all_ready() && tries < 50 {
+            drop(s);
+            test_save(sess2, path, tries + 1);
+            return;
+        }
+        // 「@」表示走真实的保存路径（后台线程 + 默认目录），
+        // 否则就按给定路径同步存一份，方便脚本直接拿文件
+        if path == "@" {
+            let idx = s.doc.borrow().sel_output();
+            s.do_save(idx);
+            return;
+        }
+        let s = s;
+        let mut doc = s.doc.borrow_mut();
+        let saved = crate::export::render_selection(&mut doc)
+            .and_then(|mut surf| crate::export::save_to_path(&mut surf, &path));
+        match saved {
+            Ok(p) => println!("{}", p.display()),
+            Err(e) => eprintln!("测试保存失败: {e}"),
+        }
+        s.app.quit();
+    });
+}
+
+/// 后台抓屏：每块屏一个线程，抓回来一块就在主线程补一块画面
+fn start_captures(sess: &SessionRef, targets: Vec<(usize, String, gdk::Rectangle)>, cursor: bool) {
+    if targets.is_empty() {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<(
+        usize,
+        String,
+        gdk::Rectangle,
+        Result<capture::Capture, String>,
+    )>();
+    for (idx, name, geo) in targets {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let r = capture::capture_output(&name, cursor);
+            let _ = tx.send((idx, name, geo, r));
+        });
+    }
+    drop(tx);
+    let sess2 = sess.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(20), move || loop {
+        match rx.try_recv() {
+            Ok((idx, name, geo, r)) => apply_capture(&sess2, idx, &name, geo, r),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return glib::ControlFlow::Break,
+        }
+    });
+}
+
+/// 把一块屏抓回来的画面接上：建画布、建纹理、识别窗口，再把图挂到窗口上
+fn apply_capture(
     sess: &SessionRef,
     idx: usize,
-    monitor: &gdk::Monitor,
-    texture: Option<gdk::Texture>,
-) -> Win {
+    connector: &str,
+    geo: gdk::Rectangle,
+    cap: Result<capture::Capture, String>,
+) {
+    let mut cap = match cap {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("抓取显示器 {connector} 失败: {e}");
+            return;
+        }
+    };
+    trace(&format!("{connector} 抓屏完（{}x{}）", cap.width, cap.height));
+    let mut phys = match export::surface_from_bgra(cap.width, cap.height, &cap.pixels) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("显示器 {connector} 画布创建失败: {e}");
+            return;
+        }
+    };
+    // 抓屏缓冲直接交给纹理：GDK 认 BGRA，不用再整屏换一遍通道
+    let texture = export::texture_from_bgra_owned(
+        std::mem::take(&mut cap.pixels),
+        cap.width as i32,
+        cap.height as i32,
+    );
+    let sx = cap.width as f64 / geo.width() as f64;
+    let sy = cap.height as f64 / geo.height() as f64;
+    if (sx / sy - 1.0).abs() > 0.02 {
+        eprintln!("显示器 {connector} 横纵缩放不一致（{sx:.3} / {sy:.3}），画面可能轻微拉伸");
+    }
+    let size = (f64::from(geo.width()), f64::from(geo.height()));
+    let origin = (f64::from(geo.x()), f64::from(geo.y()));
+    let mut win_rects = crate::windows::detect_for_output(connector, &mut phys, sx, sy, size);
+    trace(&format!("{connector} 窗口识别完（{} 块）", win_rects.len()));
+    // 窗口矩形跟着换成全局坐标，交互就只用一套坐标系
+    for r in win_rects.iter_mut() {
+        r.x0 += origin.0;
+        r.x1 += origin.0;
+        r.y0 += origin.1;
+        r.y1 += origin.1;
+    }
+    let mut s = sess.borrow_mut();
+    {
+        let mut d = s.doc.borrow_mut();
+        if let Some(o) = d.outs.get_mut(idx) {
+            o.phys = Some(phys);
+            o.sx = sx;
+            o.sy = sy;
+            o.origin = origin;
+            o.size = size;
+            o.windows = win_rects;
+        }
+    }
+    if let Some(w) = s.win_of(idx).cloned() {
+        w.screen.set_paintable(Some(&texture));
+        // 画面有了就不用再让窗口透明
+        w.window.remove_css_class("fs-pending");
+    }
+    trace(&format!("{connector} 画面已挂上"));
+    s.redraw();
+    // 画面没齐的时候按过的完成动作，等最后一块屏补齐再执行
+    if s.all_ready() {
+        if let Some(p) = s.pending.take() {
+            match p {
+                Export::Copy(i) => s.do_copy(i),
+                Export::Save(i) => s.do_save(i),
+            }
+        }
+    }
+}
+
+/// 建一个显示器的浮层窗口
+fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &gdk::Monitor) -> Win {
     let (origin, rect) = {
         let s = sess.borrow();
         let doc = s.doc.borrow();
@@ -613,9 +678,8 @@ fn make_window(
     picture.set_vexpand(true);
     // 纹理就是物理分辨率，按需拉满整块屏，避免二次采样发虚
     picture.set_content_fit(gtk::ContentFit::Fill);
-    if let Some(texture) = texture {
-        picture.set_paintable(Some(&texture));
-    }
+    // 画面抓到之前窗口是透明的，让桌面透出来（见 ui.rs 里的 .fs-pending）
+    window.add_css_class("fs-pending");
     // 手势和光标就挂在画面这一层：下面没有别的东西了
     picture.set_cursor_from_name(Some("crosshair"));
 
@@ -1035,6 +1099,11 @@ impl Session {
         }
     }
 
+    /// 所有屏的画面都抓回来了？
+    fn all_ready(&self) -> bool {
+        self.doc.borrow().outs.iter().all(|o| o.ready())
+    }
+
     /// 更新悬停窗口，返回是否有变化
     fn update_hover(&mut self, gx: f64, gy: f64) -> bool {
         let next = {
@@ -1160,7 +1229,7 @@ impl Session {
 
     /// 量一段文字的排版尺寸，用该屏的画面建上下文
     fn measure_text(&self, out: usize, text: &str, px: f64) -> Option<(f64, f64)> {
-        let surface = self.doc.borrow().outs.get(out).map(|o| o.phys.clone())?;
+        let surface = self.doc.borrow().outs.get(out).and_then(|o| o.phys.clone())?;
         crate::paint::text_size(&surface, text, px)
     }
 
@@ -1189,6 +1258,11 @@ impl Session {
             return;
         }
         self.ensure_selection(idx);
+        if !self.all_ready() {
+            trace("画面还没就绪，复制等一会儿");
+            self.pending = Some(Export::Copy(idx));
+            return;
+        }
         let Some((rgba, w, h)) = self.report(self.render_rgba(), "复制失败") else {
             return;
         };
@@ -1234,6 +1308,11 @@ impl Session {
             return;
         }
         self.ensure_selection(idx);
+        if !self.all_ready() {
+            trace("画面还没就绪，保存等一会儿");
+            self.pending = Some(Export::Save(idx));
+            return;
+        }
         let dir = self.doc.borrow().dir.clone();
         let Some((rgba, w, h)) = self.report(self.render_rgba(), "保存失败") else {
             return;

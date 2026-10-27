@@ -154,8 +154,8 @@ pub struct OutputLayer {
     /// 物理像素 / 逻辑像素
     pub sx: f64,
     pub sy: f64,
-    /// 全分辨率画面，屏幕观感方向
-    pub phys: cairo::ImageSurface,
+    /// 全分辨率画面，屏幕观感方向；抓屏还没回来时是空的
+    pub phys: Option<cairo::ImageSurface>,
     /// 这一屏上识别出来的窗口矩形（全局逻辑坐标）
     pub windows: Vec<Rect>,
     /// 打码用的块平均小图，第一次用到时才建（见 paint::mosaic_image）
@@ -163,6 +163,8 @@ pub struct OutputLayer {
 }
 
 impl OutputLayer {
+    /// 带上画面直接建好（测试和离线工具用；启动路径走 pending + 后补）
+    #[cfg(test)]
     pub fn new(
         origin: (f64, f64),
         size: (f64, f64),
@@ -176,10 +178,30 @@ impl OutputLayer {
             size,
             sx,
             sy,
-            phys,
+            phys: Some(phys),
             windows,
             mosaic: None,
         }
+    }
+
+    /// 还没抓到画面的屏：只知道它在布局里的位置和逻辑尺寸
+    ///
+    /// 浮层靠它先把压暗和工具条显示出来，画面抓到之后再补（见 overlay::apply_capture）。
+    pub fn pending(origin: (f64, f64), size: (f64, f64)) -> Self {
+        Self {
+            origin,
+            size,
+            sx: 1.0,
+            sy: 1.0,
+            phys: None,
+            windows: Vec::new(),
+            mosaic: None,
+        }
+    }
+
+    /// 画面到了没
+    pub fn ready(&self) -> bool {
+        self.phys.is_some()
     }
 
     /// 本屏在全局布局里占的矩形
