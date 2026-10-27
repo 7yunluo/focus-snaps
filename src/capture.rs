@@ -9,7 +9,12 @@ use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle, WEnum};
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::{
     self as frame, ZwlrScreencopyFrameV1,
 };
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
+};
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
+
+use crate::dmabuf;
 
 /// 一个显示器的 Wayland 侧信息
 #[derive(Clone, Debug)]
@@ -35,10 +40,13 @@ impl Default for OutputMeta {
 }
 
 /// 一帧画面，BGRA8888，行宽 = width * 4，已旋转到屏幕观感方向
+///
+/// 走零拷贝时 `pixels` 是空的，像素在 `dmabuf` 那块显存里，需要时 mmap 读。
 pub struct Capture {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+    pub dmabuf: Option<dmabuf::Buffer>,
 }
 
 struct OutputSlot {
@@ -63,6 +71,14 @@ struct State {
     copied: bool,
     /// 像素是 RGB 字节序，需要交换 R/B
     swap_rb: bool,
+    /// 合成器有没有 zwp_linux_dmabuf_v1
+    dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
+    /// 它给这一帧报的显存格式与尺寸
+    dmabuf_offer: Option<(u32, u32, u32)>,
+    /// 这一次要不要走零拷贝
+    use_dmabuf: bool,
+    /// 零拷贝用的显存缓冲
+    dmabuf_buf: Option<dmabuf::Buffer>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
@@ -146,7 +162,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                 height,
                 stride,
             } => {
-                if state.copied {
+                if state.copied || state.use_dmabuf {
                     return;
                 }
                 let format = match format {
@@ -194,8 +210,44 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                 state.fd = Some(fd);
                 state._buffer = Some(buffer);
             }
+            frame::Event::LinuxDmabuf {
+                format,
+                width,
+                height,
+            } => {
+                state.dmabuf_offer = Some((format, width, height));
+            }
+            frame::Event::BufferDone => {
+                if state.copied || !state.use_dmabuf {
+                    return;
+                }
+                let (Some(dmabuf), Some((format, w, h))) =
+                    (state.dmabuf.clone(), state.dmabuf_offer)
+                else {
+                    return;
+                };
+                match dmabuf::Buffer::allocate(w, h, format) {
+                    Ok(buf) => {
+                        let wl = buf.wrap(&dmabuf, qh);
+                        proxy.copy(&wl);
+                        state.copied = true;
+                        state.dmabuf_buf = Some(buf);
+                        state._buffer = Some(wl);
+                    }
+                    Err(e) => {
+                        // 分配不出来就退回共享内存那条路（frame 已经用掉，下次再说）
+                        eprintln!("零拷贝抓屏不可用（{e}），退回共享内存");
+                        state.failed = Some(e);
+                        state.finished = true;
+                    }
+                }
+            }
             frame::Event::Ready { .. } => {
                 state.finished = true;
+                // 零拷贝：画面已经在显存里了，不用读像素
+                if state.dmabuf_buf.is_some() {
+                    return;
+                }
                 let Some((w, h, stride)) = state.geom else {
                     state.failed = Some("缺少画面尺寸".into());
                     return;
@@ -255,6 +307,8 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
 delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore ZwlrScreencopyManagerV1);
+delegate_noop!(State: ignore zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1);
+delegate_noop!(State: ignore zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1);
 
 /// 打开一个 Wayland 连接并绑定需要的全局对象
 fn connect() -> Result<(Connection, State, wayland_client::EventQueue<State>), String> {
@@ -280,6 +334,13 @@ fn connect() -> Result<(Connection, State, wayland_client::EventQueue<State>), S
             "zwlr_screencopy_manager_v1" => {
                 let v = g.version.min(3);
                 state.manager = Some(globals.registry().bind(g.name, v, &qh, ()));
+            }
+            "zwp_linux_dmabuf_v1" => {
+                // create_immed 要 v3，带 modifier 的 add 也是 v3
+                if g.version >= 3 {
+                    let v = g.version.min(4);
+                    state.dmabuf = Some(globals.registry().bind(g.name, v, &qh, ()));
+                }
             }
             _ => {}
         }
@@ -310,15 +371,22 @@ pub fn capture_output(name: &str, with_cursor: bool) -> Result<Capture, String> 
     let (tx, rx) = std::sync::mpsc::channel();
     let name = name.to_string();
     std::thread::spawn(move || {
-        let _ = tx.send(capture_blocking(&name, with_cursor));
+        let mut result = capture_blocking(&name, with_cursor, true);
+        if result.is_err() {
+            // 零拷贝这条路走不通（合成器没报格式、分配不出来、屏是转过的）
+            // 就退回共享内存，老路一直在
+            eprintln!("零拷贝抓屏不可用，改用共享内存重试");
+            result = capture_blocking(&name, with_cursor, false);
+        }
+        let _ = tx.send(result);
     });
-    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+    match rx.recv_timeout(std::time::Duration::from_secs(8)) {
         Ok(r) => r,
         Err(_) => Err("抓屏超时：合成器 5 秒内没有返回画面".into()),
     }
 }
 
-fn capture_blocking(name: &str, with_cursor: bool) -> Result<Capture, String> {
+fn capture_blocking(name: &str, with_cursor: bool, allow_dmabuf: bool) -> Result<Capture, String> {
     let (_conn, mut state, mut queue) = connect()?;
     let manager = state
         .manager
@@ -340,6 +408,12 @@ fn capture_blocking(name: &str, with_cursor: bool) -> Result<Capture, String> {
         let slot = &state.outputs[idx];
         (slot.wl.clone(), slot.meta.clone())
     };
+    // 零拷贝只能用在不需要旋转的屏上：dma-buf 里是扫描方向的画面，
+    // 转过的屏还得靠 normalize 转一遍
+    state.use_dmabuf = allow_dmabuf
+        && meta.transform == wl_output::Transform::Normal
+        && state.dmabuf.is_some()
+        && std::env::var_os("FOCUSSNAPS_NO_DMABUF").is_none();
     let qh = queue.handle();
     let _frame = manager.capture_output(if with_cursor { 1 } else { 0 }, &output, &qh, ());
 
@@ -351,6 +425,15 @@ fn capture_blocking(name: &str, with_cursor: bool) -> Result<Capture, String> {
     if let Some(err) = state.failed.take() {
         return Err(err);
     }
+    if let Some(buf) = state.dmabuf_buf.take() {
+        let (width, height) = (buf.width, buf.height);
+        return Ok(Capture {
+            width,
+            height,
+            pixels: Vec::new(),
+            dmabuf: Some(buf),
+        });
+    }
     let pixels = state.result.take().ok_or("抓屏没有返回画面")?;
     let (w, h, _) = state.geom.ok_or("缺少画面尺寸")?;
     let (pixels, width, height) =
@@ -359,6 +442,7 @@ fn capture_blocking(name: &str, with_cursor: bool) -> Result<Capture, String> {
         width: width as u32,
         height: height as u32,
         pixels,
+        dmabuf: None,
     })
 }
 

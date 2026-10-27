@@ -160,6 +160,10 @@ pub struct OutputLayer {
     pub windows: Vec<Rect>,
     /// 打码用的块平均小图，第一次用到时才建（见 paint::mosaic_image）
     pub mosaic: Option<cairo::ImageSurface>,
+    /// 本屏画面的纹理；零拷贝时它就引用着抓屏那块显存
+    pub texture: Option<gtk::gdk::Texture>,
+    /// 零拷贝用的显存缓冲：纹理活多久它就得活多久
+    pub keep: Option<crate::dmabuf::Buffer>,
 }
 
 impl OutputLayer {
@@ -181,6 +185,8 @@ impl OutputLayer {
             phys: Some(phys),
             windows,
             mosaic: None,
+            texture: None,
+            keep: None,
         }
     }
 
@@ -196,12 +202,23 @@ impl OutputLayer {
             phys: None,
             windows: Vec::new(),
             mosaic: None,
+            texture: None,
+            keep: None,
         }
     }
 
-    /// 画面到了没
+    /// 画面齐了没
+    ///
+    /// 导出要的是像素，所以得等画布建好（零拷贝那条路的像素是后台读的）。
     pub fn ready(&self) -> bool {
         self.phys.is_some()
+    }
+
+    /// 取画布；画面还没到时是 None
+    ///
+    /// 像素在抓屏线程里就备好了（零拷贝时是 mmap 读显存），这里不用再做重活。
+    pub fn ensure_phys(&mut self) -> Option<&mut cairo::ImageSurface> {
+        self.phys.as_mut()
     }
 
     /// 本屏在全局布局里占的矩形

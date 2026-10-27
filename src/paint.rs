@@ -532,7 +532,8 @@ fn build_mosaic(out: &mut OutputLayer) -> Option<cairo::ImageSurface> {
         return None;
     }
     let mut img = cairo::ImageSurface::create(cairo::Format::ARgb32, cols, rows).ok()?;
-    let phys = out.phys.as_mut()?;
+    let (origin, sx, sy) = (out.origin, out.sx, out.sy);
+    let phys = out.ensure_phys()?;
     let stride = phys.stride() as usize;
     let (bw, bh) = (phys.width(), phys.height());
     {
@@ -544,11 +545,11 @@ fn build_mosaic(out: &mut OutputLayer) -> Option<cairo::ImageSurface> {
                 // 这一块覆盖的物理像素范围
                 let lx0 = gx0 + f64::from(i) * MOSAIC_BLOCK;
                 let ly0 = gy0 + f64::from(j) * MOSAIC_BLOCK;
-                let px0 = (((lx0 - out.origin.0) * out.sx).round().max(0.0) as i32).clamp(0, bw - 1);
-                let py0 = (((ly0 - out.origin.1) * out.sy).round().max(0.0) as i32).clamp(0, bh - 1);
-                let px1 = (((lx0 + MOSAIC_BLOCK - out.origin.0) * out.sx).round() as i32)
+                let px0 = (((lx0 - origin.0) * sx).round().max(0.0) as i32).clamp(0, bw - 1);
+                let py0 = (((ly0 - origin.1) * sy).round().max(0.0) as i32).clamp(0, bh - 1);
+                let px1 = (((lx0 + MOSAIC_BLOCK - origin.0) * sx).round() as i32)
                     .clamp(px0 + 1, bw) as usize;
-                let py1 = (((ly0 + MOSAIC_BLOCK - out.origin.1) * out.sy).round() as i32)
+                let py1 = (((ly0 + MOSAIC_BLOCK - origin.1) * sy).round() as i32)
                     .clamp(py0 + 1, bh) as usize;
                 let (mut rs, mut gs, mut bs, mut n) = (0u64, 0u64, 0u64, 0u64);
                 for py in py0 as usize..py1 {

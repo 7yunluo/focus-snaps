@@ -1,5 +1,6 @@
 // 命令行入口
 mod capture;
+mod dmabuf;
 mod doc;
 mod export;
 mod icons;

@@ -658,7 +658,7 @@ pub fn set_accent(accent: (f64, f64, f64)) {
             }
             p
         });
-        provider.load_from_data(&css);
+        provider.load_from_string(&css);
     });
 }
 

@@ -13,6 +13,15 @@ use crate::paint::draw_stroke;
 pub fn surface_from_bgra(width: u32, height: u32, pixels: &[u8]) -> Result<cairo::ImageSurface, String> {
     let w = width as i32;
     let h = height as i32;
+    // 像素长度不够就直接报错，别在下面按下标切
+    if pixels.len() < width as usize * height as usize * 4 {
+        return Err(format!(
+            "像素长度不足：{} < {}x{}x4",
+            pixels.len(),
+            width,
+            height
+        ));
+    }
     let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h)
         .map_err(|e| format!("创建画布失败: {e}"))?;
     {
@@ -34,6 +43,29 @@ pub fn surface_from_bgra(width: u32, height: u32, pixels: &[u8]) -> Result<cairo
     }
     surface.mark_dirty();
     Ok(surface)
+}
+
+/// 把零拷贝抓屏的显存缓冲直接导成 GPU 纹理
+///
+/// 不用 CPU 读回，也不用把 44 MB 上传到显存：合成器已经写在这块显存里了。
+pub fn dmabuf_texture(buf: &crate::dmabuf::Buffer) -> Result<gdk::Texture, String> {
+    use std::os::fd::AsRawFd;
+    let display = gdk::Display::default().ok_or("拿不到 GDK display")?;
+    let builder = gdk::DmabufTextureBuilder::new()
+        .set_display(&display)
+        .set_width(buf.width)
+        .set_height(buf.height)
+        .set_fourcc(buf.format)
+        .set_modifier(buf.modifier)
+        .set_n_planes(1)
+        .set_offset(0, 0)
+        .set_stride(0, buf.stride)
+        // 抓屏出来的 alpha 都是 255，按预乘处理与直通一致
+        .set_premultiplied(true);
+    // SAFETY: 缓冲由调用方（OutputLayer.dmabuf）一直持有，
+    // 纹理活多久这块显存就活多久
+    let built = unsafe { builder.set_fd(0, buf.prime.as_raw_fd()).build() };
+    built.map_err(|e| format!("显存缓冲导成纹理失败: {e}"))
 }
 
 /// 抓屏的 BGRA 像素直接当纹理用，接管所有权
@@ -82,16 +114,17 @@ pub fn render_selection(doc: &mut Doc) -> Result<cairo::ImageSurface, String> {
 
         // 底图：每块屏把自己那一段贴到画布上对应的位置
         for (i, r) in &hits {
-            let o = &outs[*i];
+            let o = &mut outs[*i];
+            let (origin, sx, sy) = (o.origin, o.sx, o.sy);
             // 画面还没抓回来的屏就没底图可贴，只剩标注
-            let Some(phys) = o.phys.as_ref() else {
+            let Some(phys) = o.ensure_phys() else {
                 continue;
             };
-            let px0 = ((r.0 - o.origin.0) * o.sx).round();
-            let py0 = ((r.1 - o.origin.1) * o.sy).round();
+            let px0 = ((r.0 - origin.0) * sx).round();
+            let py0 = ((r.1 - origin.1) * sy).round();
             let _ = cr.save();
             cr.translate((r.0 - sel.0) * kx, (r.1 - sel.1) * ky);
-            cr.scale(kx / o.sx, ky / o.sy);
+            cr.scale(kx / sx, ky / sy);
             cr.translate(-px0, -py0);
             let pat = cairo::SurfacePattern::create(phys);
             pat.set_filter(cairo::Filter::Nearest);

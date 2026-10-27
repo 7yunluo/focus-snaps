@@ -595,19 +595,39 @@ fn apply_capture(
         }
     };
     trace(&format!("{connector} 抓屏完（{}x{}）", cap.width, cap.height));
-    let mut phys = match export::surface_from_bgra(cap.width, cap.height, &cap.pixels) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("显示器 {connector} 画布创建失败: {e}");
-            return;
+    let (width, height) = (cap.width as i32, cap.height as i32);
+    // 共享内存那条路像素就在手边，先拷进画布（零拷贝的像素要等后台读）
+    let phys = if cap.pixels.is_empty() {
+        None
+    } else {
+        export::surface_from_bgra(cap.width, cap.height, &cap.pixels).ok()
+    };
+    // 优先零拷贝：合成器把画面画在显存里，纹理直接引它，
+    // 既不用等 GPU 读回，也不用再往显存上传 44 MB
+    let (texture, kept) = match cap.dmabuf {
+        Some(buf) => match export::dmabuf_texture(&buf) {
+            Ok(t) => {
+                trace("走零拷贝（显存缓冲直接当纹理）");
+                (t, Some(buf))
+            }
+            Err(e) => {
+                // 导不进纹理就退回普通纹理（慢，但总比没画面强）
+                eprintln!("{connector} 零拷贝纹理失败（{e}），改用像素上传");
+                let pixels = std::mem::take(&mut cap.pixels);
+                if pixels.is_empty() {
+                    return;
+                }
+                (export::texture_from_bgra_owned(pixels, width, height), None)
+            }
+        },
+        None => {
+            trace("走共享内存（像素拷回 CPU）");
+            (
+                export::texture_from_bgra_owned(std::mem::take(&mut cap.pixels), width, height),
+                None,
+            )
         }
     };
-    // 抓屏缓冲直接交给纹理：GDK 认 BGRA，不用再整屏换一遍通道
-    let texture = export::texture_from_bgra_owned(
-        std::mem::take(&mut cap.pixels),
-        cap.width as i32,
-        cap.height as i32,
-    );
     let sx = cap.width as f64 / geo.width() as f64;
     let sy = cap.height as f64 / geo.height() as f64;
     if (sx / sy - 1.0).abs() > 0.02 {
@@ -615,25 +635,19 @@ fn apply_capture(
     }
     let size = (f64::from(geo.width()), f64::from(geo.height()));
     let origin = (f64::from(geo.x()), f64::from(geo.y()));
-    let mut win_rects = crate::windows::detect_for_output(connector, &mut phys, sx, sy, size);
-    trace(&format!("{connector} 窗口识别完（{} 块）", win_rects.len()));
-    // 窗口矩形跟着换成全局坐标，交互就只用一套坐标系
-    for r in win_rects.iter_mut() {
-        r.x0 += origin.0;
-        r.x1 += origin.0;
-        r.y0 += origin.1;
-        r.y1 += origin.1;
-    }
+    // 零拷贝的画面还要在后台读一份像素出来（导出、打码、窗口识别要用）
+    let reader = kept.as_ref().map(|b| b.reader());
     let mut s = sess.borrow_mut();
     {
         let mut d = s.doc.borrow_mut();
         if let Some(o) = d.outs.get_mut(idx) {
-            o.phys = Some(phys);
             o.sx = sx;
             o.sy = sy;
             o.origin = origin;
             o.size = size;
-            o.windows = win_rects;
+            o.texture = Some(texture.clone());
+            o.keep = kept;
+            o.phys = phys;
         }
     }
     if let Some(w) = s.win_of(idx).cloned() {
@@ -643,7 +657,82 @@ fn apply_capture(
     }
     trace(&format!("{connector} 画面已挂上"));
     s.redraw();
+
+    // 剩下的（读像素、识别窗口）放到后台，别拦着画面出现
+    let sess2 = sess.clone();
+    let name = connector.to_string();
+    match reader {
+        Some(reader) => {
+            let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
+            std::thread::spawn(move || {
+                let _ = tx.send(reader.read_pixels());
+            });
+            glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+                match rx.try_recv() {
+                    Ok(pixels) => {
+                        finish_layer(&sess2, idx, &name, pixels.ok());
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                }
+            });
+        }
+        // 共享内存：像素已经用上了，只差识别
+        None => {
+            glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                finish_layer(&sess2, idx, &name, None)
+            });
+        }
+    }
+
     // 画面没齐的时候按过的完成动作，等最后一块屏补齐再执行
+    if s.all_ready() {
+        if let Some(p) = s.pending.take() {
+            match p {
+                Export::Copy(i) => s.do_copy(i),
+                Export::Save(i) => s.do_save(i),
+            }
+        }
+    }
+}
+
+/// 画面挂上之后再做的那部分：备好像素、识别窗口
+fn finish_layer(sess: &SessionRef, idx: usize, connector: &str, pixels: Option<Vec<u8>>) {
+    let doc = sess.borrow().doc.clone();
+    {
+        let mut d = doc.borrow_mut();
+        let Some(o) = d.outs.get_mut(idx) else {
+            return;
+        };
+        let (sx, sy, size, origin) = (o.sx, o.sy, o.size, o.origin);
+        // 零拷贝那条路的像素在后台读回来，这里只是拷进画布
+        if let Some(pixels) = pixels {
+            if let Some(t) = o.texture.as_ref() {
+                let (w, h) = (t.width() as u32, t.height() as u32);
+                match crate::export::surface_from_bgra(w, h, &pixels) {
+                    Ok(surface) => o.phys = Some(surface),
+                    Err(e) => eprintln!("建画布失败: {e}"),
+                }
+            }
+        }
+        let Some(phys) = o.ensure_phys() else {
+            return;
+        };
+        let mut rects = crate::windows::detect_for_output(connector, phys, sx, sy, size);
+        trace(&format!("{connector} 窗口识别完（{} 块）", rects.len()));
+        // 窗口矩形跟着换成全局坐标，交互就只用一套坐标系
+        for r in rects.iter_mut() {
+            r.x0 += origin.0;
+            r.x1 += origin.0;
+            r.y0 += origin.1;
+            r.y1 += origin.1;
+        }
+        o.windows = rects;
+    }
+    let mut s = sess.borrow_mut();
+    s.redraw();
+    // 画面齐了就把之前按下的完成动作做掉
     if s.all_ready() {
         if let Some(p) = s.pending.take() {
             match p {
