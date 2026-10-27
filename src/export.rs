@@ -68,6 +68,45 @@ pub fn dmabuf_texture(buf: &crate::dmabuf::Buffer) -> Result<gdk::Texture, Strin
     built.map_err(|e| format!("显存缓冲导成纹理失败: {e}"))
 }
 
+/// 从纹理把像素要回来（GPU 侧的一次拷贝，比直接读显存快得多）
+///
+/// 导出、打码、窗口识别需要 CPU 像素时才做；显存映射通常是 write-combined，
+/// 读起来慢一个数量级。
+pub fn pixels_from_texture(texture: &gdk::Texture) -> Result<(Vec<u8>, i32, i32), String> {
+    let mut downloader = gdk::TextureDownloader::new(texture);
+    downloader.set_format(gdk::MemoryFormat::B8g8r8a8Premultiplied);
+    let (bytes, stride) = downloader.download_bytes();
+    let format = downloader.format();
+    let (w, h) = (texture.width(), texture.height());
+    let row = w as usize * 4;
+    let data = bytes.as_ref();
+    let mut out = Vec::with_capacity(row * h as usize);
+    for y in 0..h as usize {
+        let start = y * stride;
+        let line = data.get(start..start + row).ok_or("下载的像素长度不够")?;
+        if format == gdk::MemoryFormat::B8g8r8a8Premultiplied {
+            out.extend_from_slice(line);
+        } else {
+            // 拿不到 BGRA 就按 RGBA 处理，顺手换回来
+            for px in line.chunks_exact(4) {
+                out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+        }
+    }
+    Ok((out, w, h))
+}
+
+/// 把紧密排列的 BGRA 像素直接包成画布，不拷贝
+pub fn surface_from_bgra_owned(pixels: Vec<u8>, width: u32, height: u32) -> Result<cairo::ImageSurface, String> {
+    let (w, h) = (width as i32, height as i32);
+    let stride = width as usize * 4;
+    if pixels.len() < stride * height as usize {
+        return Err(format!("像素长度不足：{} < {}x{}x4", pixels.len(), width, height));
+    }
+    cairo::ImageSurface::create_for_data(pixels, cairo::Format::ARgb32, w, h, stride as i32)
+        .map_err(|e| format!("画布接管像素失败: {e}"))
+}
+
 /// 抓屏的 BGRA 像素直接当纹理用，接管所有权
 ///
 /// GDK 的显存格式本来就认 BGRA（cairo 画布也是这个顺序），不用再整屏换通道：

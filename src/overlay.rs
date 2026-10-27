@@ -706,8 +706,8 @@ fn apply_capture(
         eprintln!("显示器 {connector} 横纵缩放不一致（{sx:.3} / {sy:.3}），画面可能轻微拉伸");
     }
     let origin = (f64::from(geo.x()), f64::from(geo.y()));
-    // 零拷贝的画面还要在后台读一份像素出来（导出、打码、窗口识别要用）
-    let reader = kept.as_ref().map(|b| b.reader());
+    // 零拷贝的画面还要取一份像素（导出、打码、窗口识别要用）
+    let need_pixels = kept.is_some();
     let mut s = sess.borrow_mut();
     {
         let mut d = s.doc.borrow_mut();
@@ -732,19 +732,27 @@ fn apply_capture(
     // 剩下的（读像素、识别窗口）放到后台，别拦着画面出现
     let sess2 = sess.clone();
     let name = connector.to_string();
-    match reader {
-        Some(reader) => {
-            let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
-            std::thread::spawn(move || {
-                // 读显存是一大坨内存操作，降到最低优先级，别跟拖拽抢带宽
-                // SAFETY: 只是把本线程的 nice 值调高
-                unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 19) };
-                let _ = tx.send(reader.read_pixels());
+    match need_pixels {
+        true => {
+            // 像素从纹理下载：GPU 侧一次拷贝，DP-1 上 69 ms。
+            // 直接读显存（mmap）更省主线程但要 870 ms，那段时间洞里是黑的。
+            // 纹理不是 Send，所以下载只能在主线程，赶在浮层刚出现的瞬间做掉。
+            let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, i32, i32)>();
+            let texture = texture.clone();
+            glib::idle_add_local_once(move || {
+                let t = std::time::Instant::now();
+                match export::pixels_from_texture(&texture) {
+                    Ok(v) => {
+                        trace(&format!("取像素花了 {} ms", t.elapsed().as_millis()));
+                        let _ = tx.send(v);
+                    }
+                    Err(e) => eprintln!("取像素失败: {e}"),
+                }
             });
             glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
                 match rx.try_recv() {
-                    Ok(pixels) => {
-                        finish_layer(&sess2, idx, &name, pixels.ok());
+                    Ok((pixels, w, h)) => {
+                        finish_layer(&sess2, idx, &name, Some((pixels, w, h)));
                         glib::ControlFlow::Break
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -753,7 +761,7 @@ fn apply_capture(
             });
         }
         // 共享内存：像素已经用上了，只差识别
-        None => {
+        false => {
             glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
                 finish_layer(&sess2, idx, &name, None)
             });
@@ -772,7 +780,13 @@ fn apply_capture(
 }
 
 /// 画面挂上之后再做的那部分：备好像素、识别窗口
-fn finish_layer(sess: &SessionRef, idx: usize, connector: &str, pixels: Option<Vec<u8>>) {
+fn finish_layer(
+    sess: &SessionRef,
+    idx: usize,
+    connector: &str,
+    pixels: Option<(Vec<u8>, i32, i32)>,
+) {
+    let t = std::time::Instant::now();
     let doc = sess.borrow().doc.clone();
     {
         let mut d = doc.borrow_mut();
@@ -780,14 +794,11 @@ fn finish_layer(sess: &SessionRef, idx: usize, connector: &str, pixels: Option<V
             return;
         };
         let (sx, sy, size, origin) = (o.sx, o.sy, o.size, o.origin);
-        // 零拷贝那条路的像素在后台读回来，这里只是拷进画布
-        if let Some(pixels) = pixels {
-            if let Some(t) = o.texture.as_ref() {
-                let (w, h) = (t.width() as u32, t.height() as u32);
-                match crate::export::surface_from_bgra(w, h, &pixels) {
-                    Ok(surface) => o.phys = Some(surface),
-                    Err(e) => eprintln!("建画布失败: {e}"),
-                }
+        // 像素直接交给画布（零拷贝，不搬家）
+        if let Some((pixels, w, h)) = pixels {
+            match crate::export::surface_from_bgra_owned(pixels, w as u32, h as u32) {
+                Ok(surface) => o.phys = Some(surface),
+                Err(e) => eprintln!("建画布失败: {e}"),
             }
         }
         let Some(phys) = o.ensure_phys() else {
@@ -804,6 +815,7 @@ fn finish_layer(sess: &SessionRef, idx: usize, connector: &str, pixels: Option<V
         }
         o.windows = rects;
     }
+    trace(&format!("备像素+识别花了 {} ms", t.elapsed().as_millis()));
     let mut s = sess.borrow_mut();
     s.redraw();
     // 画面齐了就把之前按下的完成动作做掉
