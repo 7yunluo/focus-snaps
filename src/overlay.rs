@@ -958,7 +958,8 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
         let entry = ui.entry.clone();
         let view = view.clone();
         let drawn = std::cell::Cell::new(false);
-        annot.set_draw_func(move |_a, cr, _w, _h| {
+        let overlay2 = overlay.clone();
+        annot.set_draw_func(move |a, cr, _w, _h| {
             if !drawn.get() {
                 drawn.set(true);
                 trace("首帧光栅化");
@@ -975,7 +976,14 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
             let preview = preview
                 .as_ref()
                 .map(|(x, y, t)| (*x, *y, t.as_str()));
-            paint::paint(cr, &mut doc, idx, view.get(), preview);
+            // 画布原点用控件「实际」落在哪，而不是上一帧算出来的位置：
+            // 拖拽时标注层跟着选区走，GTK 的布局要到下一帧才落地，
+            // 用算出来的位置会让洞里的画面和边框错开。
+            let view = a
+                .compute_bounds(&overlay2)
+                .map(|b| (origin.0 + f64::from(b.x()), origin.1 + f64::from(b.y())))
+                .unwrap_or_else(|| view.get());
+            paint::paint(cr, &mut doc, idx, view, preview);
         });
     }
 

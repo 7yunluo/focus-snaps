@@ -49,6 +49,21 @@ pub struct Capture {
     pub dmabuf: Option<dmabuf::Buffer>,
 }
 
+impl Capture {
+    /// 取出紧密排列的 BGRA 像素
+    ///
+    /// 零拷贝那条路画面在显存里，这里现读一份（CLI 的 grab/full 用得到）。
+    pub fn into_pixels(self) -> Result<Vec<u8>, String> {
+        if !self.pixels.is_empty() {
+            return Ok(self.pixels);
+        }
+        match self.dmabuf {
+            Some(buf) => buf.reader().read_pixels(),
+            None => Err("抓屏没有返回画面".into()),
+        }
+    }
+}
+
 struct OutputSlot {
     wl: wl_output::WlOutput,
     meta: OutputMeta,

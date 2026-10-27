@@ -140,8 +140,17 @@ fn cmd_grab(argv: &[String]) -> i32 {
             return 1;
         }
     };
+    // 零拷贝那条路画面在显存里，这里读一份像素出来（CLI 要的就是像素）
+    let (width, height) = (cap.width, cap.height);
+    let pixels = match cap.into_pixels() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("抓屏失败: {e}");
+            return 1;
+        }
+    };
     if let Some(path) = args.value(&["--png"]) {
-        let mut surface = match export::surface_from_bgra(cap.width, cap.height, &cap.pixels) {
+        let mut surface = match export::surface_from_bgra(width, height, &pixels) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("{e}");
@@ -150,7 +159,7 @@ fn cmd_grab(argv: &[String]) -> i32 {
         };
         return match export::save_to_path(&mut surface, &path) {
             Ok(p) => {
-                println!("{}x{} {}", cap.width, cap.height, p.display());
+                println!("{width}x{height} {}", p.display());
                 0
             }
             Err(e) => {
@@ -160,9 +169,9 @@ fn cmd_grab(argv: &[String]) -> i32 {
         };
     }
     let mut stdout = std::io::stdout().lock();
-    if stdout.write_all(&cap.width.to_le_bytes()).is_err()
-        || stdout.write_all(&cap.height.to_le_bytes()).is_err()
-        || stdout.write_all(&cap.pixels).is_err()
+    if stdout.write_all(&width.to_le_bytes()).is_err()
+        || stdout.write_all(&height.to_le_bytes()).is_err()
+        || stdout.write_all(&pixels).is_err()
     {
         eprintln!("写 stdout 失败");
         return 1;
@@ -208,7 +217,15 @@ fn cmd_full(argv: &[String]) -> i32 {
             return 1;
         }
     };
-    let mut surface = match export::surface_from_bgra(cap.width, cap.height, &cap.pixels) {
+    let (width, height) = (cap.width, cap.height);
+    let pixels = match cap.into_pixels() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("抓屏失败: {e}");
+            return 1;
+        }
+    };
+    let mut surface = match export::surface_from_bgra(width, height, &pixels) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{e}");
@@ -292,7 +309,15 @@ fn cmd_detect(argv: &[String]) -> i32 {
                 return 1;
             }
         };
-        match export::surface_from_bgra(cap.width, cap.height, &cap.pixels) {
+        let (width, height) = (cap.width, cap.height);
+        let pixels = match cap.into_pixels() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("抓屏失败: {e}");
+                return 1;
+            }
+        };
+        match export::surface_from_bgra(width, height, &pixels) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("{e}");
