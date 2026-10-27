@@ -327,7 +327,15 @@ A/B（每次 3~4 轮 ×10 秒，跑 `pnpm vite build` 当负载）：
 页迁移里，谁分配得勤谁挨打。这台机器的 `compact_stall` 累计六万多、`compact_fail`
 五万多（几乎都在白干）。
 
-处理办法（系统侧，`/etc` 里持久化或换 `defrag=never`）：
+为什么这台机器会这样：内核是 `linux-cachyos`，编译时把
+`CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS=y`（enabled=always）写死了，配套的 defrag
+默认值也是 `always`（direct）。再加上机器已经跑了十几个小时、24 GB 是 shmem、
+swap 用了 32 GB、构建又在不停换页——物理内存碎得拼不出 2 MB 连续块，
+`compact_fail` 是 `compact_success` 的八倍，每次都在白费力气。跑着的 KVM 虚拟机
+还要为每个被迁移的页做影子页表失效，单次更贵。
+
+处理办法（已持久化到 `/etc/tmpfiles.d/thp-defrag.conf`，`systemd-tmpfiles-setup`
+在 sysinit 阶段写 sysfs；删掉这个文件就回到内核默认）：
 
 ```sh
 echo never | sudo tee /sys/kernel/mm/transparent_hugepage/defrag
