@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1600" height="1250" viewBox="0 0 1600 1250">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#101016"/>
+      <stop offset="0.6" stop-color="#151219"/>
+      <stop offset="1" stop-color="#1d1417"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.14" cy="0.05" r="0.65">
+      <stop offset="0" stop-color="#ffb88c" stop-opacity="0.14"/>
+      <stop offset="1" stop-color="#ffb88c" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="cardShadow" x="-10%" y="-10%" width="120%" height="128%">
+      <feDropShadow dx="0" dy="28" stdDeviation="36" flood-color="#000000" flood-opacity="0.62"/>
+    </filter>
+    <clipPath id="cardClip"><rect x="100" y="230" width="1400" height="940" rx="20"/></clipPath>
+    <style>
+      .title { font-family: "Adwaita Sans", "Noto Sans CJK SC", sans-serif; font-weight: 700; fill: #f7f2ed; }
+      .sub   { font-family: "Adwaita Sans", "Noto Sans CJK SC", sans-serif; font-weight: 400; fill: #b6a9a0; }
+      .chip  { font-family: "Adwaita Sans", "Noto Sans CJK SC", sans-serif; font-weight: 500; fill: #e9dfd8; }
+      .accent { fill: #ffb88c; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1250" fill="url(#bg)"/>
+  <rect width="1600" height="1250" fill="url(#glow)"/>
+
+  <image xlink:href="logo.png" x="60" y="52" width="86" height="86"/>
+  <text class="title" x="170" y="108" font-size="52">FocusSnapS</text>
+  <text class="sub" x="172" y="146" font-size="21">Wayland 截图与标注工具 · 多显示器 · 分数缩放 · 就地标注</text>
+
+  <text class="sub" x="1540" y="92" font-size="18" text-anchor="end">niri / wlroots</text>
+
+  <g filter="url(#cardShadow)">
+    <rect x="100" y="230" width="1400" height="940" rx="20" fill="#0d0d11"/>
+    <image xlink:href="shot-crop.png" x="100" y="230" width="1400" height="940" clip-path="url(#cardClip)" preserveAspectRatio="xMidYMid slice"/>
+    <rect x="100" y="230" width="1400" height="940" rx="20" fill="none" stroke="#ffffff" stroke-opacity="0.09" stroke-width="2"/>
+  </g>
+
+  <g font-size="19">
+    <circle class="accent" cx="112" cy="1216" r="5"/>
+    <text class="chip" x="130" y="1223">窗口自动识别 / 自由框选</text>
+    <circle class="accent" cx="500" cy="1216" r="5"/>
+    <text class="chip" x="518" y="1223">10 种标注工具</text>
+    <circle class="accent" cx="770" cy="1216" r="5"/>
+    <text class="chip" x="788" y="1223">24 色调色板</text>
+    <circle class="accent" cx="1024" cy="1216" r="5"/>
+    <text class="chip" x="1042" y="1223">文字就地输入</text>
+    <circle class="accent" cx="1300" cy="1216" r="5"/>
+    <text class="chip" x="1318" y="1223">复制即用</text>
+  </g>
+</svg>

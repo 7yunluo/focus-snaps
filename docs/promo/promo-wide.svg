@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1280" height="640" viewBox="0 0 1280 640">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#101016"/>
+      <stop offset="0.62" stop-color="#151219"/>
+      <stop offset="1" stop-color="#1d1417"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.12" cy="0.08" r="0.7">
+      <stop offset="0" stop-color="#ffb88c" stop-opacity="0.15"/>
+      <stop offset="1" stop-color="#ffb88c" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="cardShadow" x="-12%" y="-12%" width="124%" height="130%">
+      <feDropShadow dx="0" dy="20" stdDeviation="26" flood-color="#000000" flood-opacity="0.62"/>
+    </filter>
+    <clipPath id="cardClip"><rect x="452" y="60" width="772" height="520" rx="16"/></clipPath>
+    <style>
+      .title { font-family: "Adwaita Sans", "Noto Sans CJK SC", sans-serif; font-weight: 700; fill: #f7f2ed; }
+      .sub   { font-family: "Adwaita Sans", "Noto Sans CJK SC", sans-serif; font-weight: 400; fill: #b6a9a0; }
+      .chip  { font-family: "Adwaita Sans", "Noto Sans CJK SC", sans-serif; font-weight: 500; fill: #e9dfd8; }
+      .accent { fill: #ffb88c; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <rect width="1280" height="640" fill="url(#glow)"/>
+
+  <image xlink:href="logo.png" x="56" y="66" width="68" height="68"/>
+  <text class="title" x="140" y="118" font-size="40">FocusSnapS</text>
+
+  <text class="sub" x="58" y="196" font-size="17">Wayland 截图与标注工具</text>
+  <text class="sub" x="58" y="222" font-size="17">多显示器 · 分数缩放 · 就地标注</text>
+
+  <g font-size="16">
+    <circle class="accent" cx="64" cy="286" r="4"/>
+    <text class="chip" x="80" y="292">窗口自动识别 / 自由框选</text>
+    <circle class="accent" cx="64" cy="324" r="4"/>
+    <text class="chip" x="80" y="330">10 种标注工具 · 24 色调色板</text>
+    <circle class="accent" cx="64" cy="362" r="4"/>
+    <text class="chip" x="80" y="368">文字就地输入 · 滚轮调字号</text>
+    <circle class="accent" cx="64" cy="400" r="4"/>
+    <text class="chip" x="80" y="406">回车复制 · Ctrl+S 保存</text>
+  </g>
+
+  <text class="sub" x="58" y="576" font-size="15">niri / wlroots</text>
+
+  <g filter="url(#cardShadow)">
+    <rect x="452" y="60" width="772" height="520" rx="16" fill="#0d0d11"/>
+    <image xlink:href="shot-tight.png" x="452" y="60" width="772" height="520" clip-path="url(#cardClip)" preserveAspectRatio="xMidYMid slice"/>
+    <rect x="452" y="60" width="772" height="520" rx="16" fill="none" stroke="#ffffff" stroke-opacity="0.09" stroke-width="2"/>
+  </g>
+</svg>
