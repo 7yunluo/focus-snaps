@@ -326,6 +326,10 @@ pub fn text_size(surface: &cairo::ImageSurface, text: &str, px: f64) -> Option<(
 
 /// 画一笔标注（全局逻辑坐标）
 pub fn draw_stroke(cr: &cairo::Context, outs: &mut [OutputLayer], s: &Stroke) {
+    // 上一笔可能把路径留在那儿没清（文字/序号里 move_to 过），而 save/restore
+    // 不管路径。arc 会把当前点和弧线起点连起来——不清掉的话，先点个序号再画
+    // 椭圆，就会多出一条从序号连到椭圆的线
+    cr.new_path();
     let (r, g, b) = s.color;
     match s.tool {
         Tool::Brush | Tool::Highlighter => {
@@ -431,6 +435,7 @@ pub fn draw_stroke(cr: &cairo::Context, outs: &mut [OutputLayer], s: &Stroke) {
                 cr.set_source_rgba(r, g, b, 1.0);
                 cr.move_to(s.points[0].0, s.points[0].1);
                 show_layout(cr, &layout);
+                let _ = cr.new_path();
                 let _ = cr.restore();
             }
         }
@@ -450,6 +455,7 @@ pub fn draw_stroke(cr: &cairo::Context, outs: &mut [OutputLayer], s: &Stroke) {
                 y - th as f64 / 2.0,
             );
             show_layout(cr, &layout);
+            let _ = cr.new_path();
             let _ = cr.restore();
         }
         Tool::Select => {}
@@ -747,6 +753,58 @@ mod tests {
         assert_eq!(gx0 % 12.0, 0.0);
         assert_eq!(gy0, 0.0);
         assert_eq!(gx0, 996.0, "1000 向上取整到 12 的倍数");
+    }
+
+    #[test]
+    fn number_does_not_leave_a_line_to_the_next_shape() {
+        // 序号画完会在路径里留下当前点（move_to 过字形），而 save/restore 不管
+        // 路径；下一笔椭圆用 arc 画时 cairo 会把弧线起点接到那个点上，表现就是
+        // 从序号到椭圆多出一条线。所以：画不画序号，除了序号自己那一小块，
+        // 别的地方必须一模一样。
+        let number = Stroke {
+            tool: Tool::Number,
+            color: (1.0, 0.0, 0.0),
+            width: 4.0,
+            points: vec![(60.0, 60.0)],
+            text: None,
+            number: Some(1),
+            text_size: None,
+        };
+        let ellipse = Stroke {
+            tool: Tool::Ellipse,
+            color: (1.0, 0.0, 0.0),
+            width: 4.0,
+            points: vec![(250.0, 120.0), (350.0, 180.0)],
+            text: None,
+            number: None,
+            text_size: None,
+        };
+        let draw = |strokes: &[Stroke]| {
+            let mut doc = doc_with(400, 200, 2.0);
+            doc.sel = Some(Selection {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 400.0,
+                y1: 200.0,
+            });
+            for s in strokes {
+                doc.commit(s.clone());
+            }
+            render(&mut doc, 400, 200).0
+        };
+        let only_ellipse = draw(&[ellipse.clone()]);
+        let with_number = draw(&[number, ellipse]);
+        for y in 0..200usize {
+            for x in 0..400usize {
+                let i = (y * 400 + x) * 4;
+                if only_ellipse[i..i + 3] == with_number[i..i + 3] {
+                    continue;
+                }
+                // 序号本身（半径 10 出头）以外不该有变化
+                let far = (x as f64 - 60.0).abs() > 22.0 || (y as f64 - 60.0).abs() > 22.0;
+                assert!(!far, "({x},{y}) 多了东西：序号和椭圆之间被连了一条线");
+            }
+        }
     }
 
     #[test]
