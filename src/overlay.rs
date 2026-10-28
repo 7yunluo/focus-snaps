@@ -77,6 +77,8 @@ struct Win {
     origin: (f64, f64),
     /// 本屏在全局布局里占的矩形
     rect: Rect4,
+    /// 当前光标名（避免重复设置，设一次要查光标主题）
+    cursor: std::cell::Cell<&'static str>,
 }
 
 struct Session {
@@ -106,6 +108,8 @@ struct Session {
     pending_hover: Option<(f64, f64)>,
     /// 已经排了一帧，别重复排
     pointer_queued: bool,
+    /// 指针最后的位置（屏下标 + 全局逻辑坐标），用来决定光标形状
+    pointer_at: Option<(usize, f64, f64)>,
     /// 正在后台读像素的屏（别重复读）
     pixels_reading: Vec<usize>,
     /// 收窗口之后的超时保险已经上过了
@@ -432,6 +436,7 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         pending_drag: None,
         pending_hover: None,
         pointer_queued: false,
+        pointer_at: None,
         pixels_reading: Vec::new(),
         export_timeout_armed: false,
     }));
@@ -1173,6 +1178,7 @@ fn finish_layer(sess: &SessionRef, idx: usize, rects: &[crate::windows::Rect]) {
 impl Session {
     /// 记下最新的指针位置；拖动和悬停各自只保留最后一个
     fn queue_pointer(&mut self, idx: usize, gx: f64, gy: f64) {
+        self.pointer_at = Some((idx, gx, gy));
         if self.drag.kind != DragKind::None {
             self.pending_drag = Some((idx, gx, gy));
         } else {
@@ -1251,6 +1257,8 @@ fn schedule_pointer(sess: &SessionRef) {
                 s.redraw();
             }
         }
+        // 光标跟着指针走：选区里是移动、边上/角上是伸缩、外面是十字准星
+        s.refresh_cursor();
         glib::ControlFlow::Break
     });
 }
@@ -1624,6 +1632,7 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
         ui,
         origin,
         rect,
+        cursor: std::cell::Cell::new("crosshair"),
     }
 }
 
@@ -1814,12 +1823,51 @@ impl Session {
                 w.ui.palette.set_visible(false);
                 w.ui.hint.set_visible(sel.is_none());
             }
-            // 截图时指针始终是十字准星（只有打字时换成 I 形）
-            let cursor = match tool {
-                Tool::Text => "text",
-                _ => "crosshair",
-            };
-            w.screen.set_cursor_from_name(Some(cursor));
+            // 光标形状按指针位置算（选区里是移动、边上/角上是伸缩）
+            self.refresh_cursor();
+        }
+    }
+
+    /// 指针该用哪个光标
+    ///
+    /// 选框里是「移动」，边上是伸缩，角上是对角伸缩，外面还是十字准星；
+    /// 拖动过程中按「正在拖什么」定，不跟着指针漂（不然手一抖光标就变了）。
+    fn cursor_at(&self, idx: usize, x: f64, y: f64) -> &'static str {
+        if let Some(name) = drag_cursor(self.drag.kind) {
+            return name;
+        }
+        let d = self.doc.borrow();
+        match d.tool {
+            Tool::Text => return "text",
+            Tool::Select => {}
+            _ => return "crosshair",
+        }
+        let Some(sel) = d.sel.map(|s| s.normalized()) else {
+            return "crosshair";
+        };
+        if let Some(h) = handle_at(sel, x, y) {
+            return handle_cursor(h);
+        }
+        // 全屏选区不算「可以拖着走」的那种选区，拖起来是重新框选
+        let out_size = d.outs.get(idx).map(|o| o.size).unwrap_or((0.0, 0.0));
+        if contains(sel, x, y) && !covers_most(sel, out_size) {
+            "move"
+        } else {
+            "crosshair"
+        }
+    }
+
+    /// 按指针最后的位置刷新光标
+    fn refresh_cursor(&self) {
+        let Some((idx, x, y)) = self.pointer_at else {
+            return;
+        };
+        let name = self.cursor_at(idx, x, y);
+        if let Some(w) = self.win_of(idx) {
+            if w.cursor.get() != name {
+                w.cursor.set(name);
+                w.screen.set_cursor_from_name(Some(name));
+            }
         }
     }
 
@@ -2115,6 +2163,26 @@ fn parse_rect(spec: &str) -> Option<(f64, f64, f64, f64)> {
 fn covers_most(r: (f64, f64, f64, f64), size: (f64, f64)) -> bool {
     let area = (r.2 - r.0) * (r.3 - r.1);
     area >= 0.98 * size.0 * size.1
+}
+
+/// 手柄下标 → 光标（顺序见 paint::handle_points）
+fn handle_cursor(h: usize) -> &'static str {
+    match h {
+        0 | 4 => "nwse-resize",
+        2 | 6 => "nesw-resize",
+        1 | 5 => "ns-resize",
+        _ => "ew-resize",
+    }
+}
+
+/// 拖动过程中固定用哪种光标；None 表示没在拖，按位置算
+fn drag_cursor(kind: DragKind) -> Option<&'static str> {
+    match kind {
+        DragKind::Resize(h) => Some(handle_cursor(h)),
+        DragKind::Move | DragKind::MoveText => Some("move"),
+        DragKind::NewSel | DragKind::Draw => Some("crosshair"),
+        DragKind::None => None,
+    }
 }
 
 fn contains(r: (f64, f64, f64, f64), x: f64, y: f64) -> bool {
