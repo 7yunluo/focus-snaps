@@ -79,7 +79,29 @@ fn check_known(args: &[String], with_value: &[&str], flags: &[&str]) -> Option<S
     None
 }
 
+/// 把 panic 也记到文件里
+///
+/// 浮层一般是热键拉起来的，stderr 没人看。要是有谁在信号回调里 panic 了，
+/// 表现就是「窗口突然没了，什么都没发生」，但现场全丢了。留个文件好查。
+fn log_panics() {
+    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let path = format!("{dir}/focus-snaps.log");
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        let msg = format!("[panic] {info}\n");
+        eprint!("{msg}");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = f.write_all(msg.as_bytes());
+        }
+    }));
+}
+
 fn main() {
+    log_panics();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let code = match argv.first().map(|s| s.as_str()) {
         Some("grab") => cmd_grab(&argv[1..]),

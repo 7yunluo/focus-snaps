@@ -241,6 +241,32 @@ pub(crate) fn trace(msg: &str) {
     }
 }
 
+/// 复制/保存这条链路的日志
+///
+/// 浮层一般是热键拉起来的，stderr 没人看；而「窗口消失了却没复制」这种问题
+/// 又必须看到现场。这条链路上事件很少，无条件写文件不心疼。
+/// 位置：`$FOCUSSNAPS_LOG`，没设就是 `$XDG_RUNTIME_DIR/focus-snaps.log`。
+pub(crate) fn log_export(msg: &str) {
+    use std::io::Write;
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let path = PATH.get_or_init(|| {
+        std::env::var("FOCUSSNAPS_LOG").unwrap_or_else(|_| {
+            let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+            format!("{dir}/focus-snaps.log")
+        })
+    });
+    let line = format!("[+{:>5} ms] {msg}\n", trace_ms());
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// 进程启动到现在的毫秒数
+fn trace_ms() -> u128 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis()
+}
+
 /// 是不是开了 tracing（热路径上每次都要问，缓存住）
 pub(crate) fn trace_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -773,6 +799,16 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
                 }
                 s.redraw();
             }
+            if let Ok(v) = std::env::var("FOCUSSNAPS_TEST_COPY") {
+                // 值是延迟毫秒数：模拟「过一会儿用户才双击确认」
+                let delay = v.parse::<u64>().unwrap_or(100).min(10_000);
+                let sess = sess.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
+                    let mut s = sess.borrow_mut();
+                    let idx = s.doc.borrow().sel_output();
+                    s.do_copy(idx);
+                });
+            }
             if let Ok(path) = std::env::var("FOCUSSNAPS_TEST_SAVE") {
                 test_save(sess.clone(), path, 0);
             }
@@ -1050,6 +1086,8 @@ fn start_pixel_broker(sess: &SessionRef) {
             (want, todo)
         };
         if want && !todo.is_empty() {
+            trace(&format!("取像素：要补的屏 {todo:?}"));
+            log_export(&format!("取像素：要补的屏 {todo:?}"));
             for i in todo {
                 fetch_pixels(&sess2, i);
             }
@@ -1074,11 +1112,13 @@ fn fetch_pixels(sess: &SessionRef, idx: usize) {
         s.pixels_reading.push(idx);
         (reader, texture)
     };
+    trace(&format!("取像素：屏 {idx} 走{}", if reader.is_some() { "显存缓冲" } else { "纹理下载" }));
     let Some(reader) = reader else {
         // 共享内存那条路没有可读的缓冲，只能下载（数据本来就在内存里，是拷贝）
         if let Some(texture) = texture {
-            if let Ok((pixels, w, h)) = export::pixels_from_texture(&texture) {
-                store_pixels(sess, idx, pixels, w, h);
+            match export::pixels_from_texture(&texture) {
+                Ok((pixels, w, h)) => store_pixels(sess, idx, pixels, w, h),
+                Err(e) => eprintln!("从纹理取像素失败: {e}"),
             }
         }
         if let Ok(mut s) = sess.try_borrow_mut() {
@@ -1117,6 +1157,7 @@ fn fetch_pixels(sess: &SessionRef, idx: usize) {
 fn store_pixels(sess: &SessionRef, idx: usize, pixels: Vec<u8>, w: i32, h: i32) {
     let surface = crate::export::surface_from_bgra_owned(pixels, w as u32, h as u32);
     let Ok(mut s) = sess.try_borrow_mut() else {
+        trace("像素到手了，但会话正被借用，丢了");
         return;
     };
     s.pixels_reading.retain(|i| *i != idx);
@@ -1128,6 +1169,8 @@ fn store_pixels(sess: &SessionRef, idx: usize, pixels: Vec<u8>, w: i32, h: i32) 
         }
         Err(e) => eprintln!("建画布失败: {e}"),
     }
+    trace(&format!("像素到手：屏 {idx} 已建画布，接着导出"));
+    log_export(&format!("像素到手：屏 {idx}"));
     s.redraw();
     s.flush_pending();
 }
@@ -1211,6 +1254,14 @@ impl Session {
 
     /// 画面齐了就把之前按下的完成动作做掉
     fn flush_pending(&mut self) {
+        if self.pending.is_some() && (!self.all_ready() || !self.pixels_ready()) {
+            trace(&format!(
+                "挂着的导出还差：画面齐={} 像素齐={}",
+                self.all_ready(),
+                self.pixels_ready()
+            ));
+            return;
+        }
         if !self.all_ready() || !self.pixels_ready() {
             return;
         }
@@ -1415,7 +1466,11 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
                 phase(6);
                 // 拖动期间指针事件只走 gesture
                 motion.set_propagation_phase(gtk::PropagationPhase::None);
-                let mut s = sess.borrow_mut();
+                // 借不到说明这次事件是别的回调重入带进来的，跳过就好——
+                // 在信号回调里 panic 会直接把进程 abort
+                let Ok(mut s) = sess.try_borrow_mut() else {
+                    return;
+                };
                 on_drag_begin(&mut s, idx, x + origin.0, y + origin.1);
                 // 框选/缩放/移动期间工具条要收起来（sync_ui 里判的 selecting），
                 // 不在这儿同步一次的话它会一直停在原处，看着像没跟着走
@@ -1429,8 +1484,12 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
                 phase(6);
                 // 高回报率鼠标一秒能报上千个位置，同一帧里只处理最新那个：
                 // 每个事件都跑一遍几何计算和 widget 更新纯属浪费
-                let anchor = sess.borrow().drag.anchor;
-                sess.borrow_mut().queue_pointer(idx, anchor.0 + ox, anchor.1 + oy);
+                let Ok(mut s) = sess.try_borrow_mut() else {
+                    return;
+                };
+                let anchor = s.drag.anchor;
+                s.queue_pointer(idx, anchor.0 + ox, anchor.1 + oy);
+                drop(s);
                 schedule_pointer(&sess);
             }
         });
@@ -1440,7 +1499,9 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
             move |_g, ox, oy| {
                 phase(6);
                 motion.set_propagation_phase(gtk::PropagationPhase::Bubble);
-                let mut s = sess.borrow_mut();
+                let Ok(mut s) = sess.try_borrow_mut() else {
+                    return;
+                };
                 let anchor = s.drag.anchor;
                 on_drag_end(&mut s, idx, anchor.0 + ox, anchor.1 + oy);
                 s.redraw();
@@ -1457,7 +1518,9 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
         click.connect_released({
             let sess = sess.clone();
             move |_g, _n, x, y| {
-                let mut s = sess.borrow_mut();
+                let Ok(mut s) = sess.try_borrow_mut() else {
+                    return;
+                };
                 if s.drag.kind == DragKind::None {
                     return;
                 }
@@ -1965,8 +2028,13 @@ impl Session {
     /// 让用户对着一个已经没有用的浮层干等一秒，比什么都难受；收起来他立刻
     /// 就看见自己的桌面，剪贴板/文件过一会儿到位。
     fn hide_windows(&mut self) {
+        // **不能同步隐藏**：把窗口 unmap 掉会掐掉正在进行的拖动，GTK 会在
+        // 我们这次信号回调还没退出去的时候重入 drag_end，而外面的 RefCell
+        // 还借着——直接 panic（在 extern "C" 回调里就是 abort，表现成
+        // 「窗口消失、什么都没发生」）。丢到下一轮主循环再收。
         for w in &self.wins {
-            w.window.set_visible(false);
+            let win = w.window.clone();
+            glib::idle_add_local_once(move || win.set_visible(false));
         }
         // 窗口收起来之后就没法用界面自救了：万一导出那条路卡死（wl-copy 不返回
         // 之类），这里兜一下，别留一个「看不见但还活着」的进程攥着键盘
@@ -1994,6 +2062,12 @@ impl Session {
 
     /// 复制选区并退出
     fn do_copy(&mut self, idx: Option<usize>) {
+        log_export(&format!(
+            "do_copy 进来：屏 {idx:?}，exporting={}，画面齐={}，像素齐={}",
+            self.exporting,
+            self.all_ready(),
+            self.pixels_ready()
+        ));
         if self.exporting {
             return;
         }
@@ -2002,20 +2076,30 @@ impl Session {
         // 像素还在后台读也没关系，浮层已经收了，读回来接着做
         if !self.all_ready() || !self.pixels_ready() {
             trace("画面/像素还没就绪，复制等一会儿（浮层已收）");
+            log_export("复制：挂起等像素");
             self.pending = Some(Export::Copy(idx));
             return;
         }
         let Some((rgba, w, h)) = self.report(self.render_rgba(), "复制失败") else {
+            log_export("复制：渲染失败，窗口还回去");
             self.show_windows();
             return;
         };
+        log_export(&format!("复制：渲染好了 {w}x{h}，交给后台出图"));
         self.exporting = true;
         let rgba = std::sync::Arc::new(rgba);
         let worker = rgba.clone();
         let (tx, rx) = std::sync::mpsc::channel::<bool>();
         std::thread::spawn(move || {
+            let t = std::time::Instant::now();
             let copied = match export::encode_png_rgba(&worker, w, h) {
-                Ok(png) => export::copy_png_via_wl_copy(&png).is_ok(),
+                Ok(png) => {
+                    trace(&format!("复制：PNG 编好了（{} kB，{} ms）", png.len() / 1024, t.elapsed().as_millis()));
+                    let r = export::copy_png_via_wl_copy(&png);
+                    trace(&format!("复制：wl-copy 返回 {r:?}"));
+                    log_export(&format!("复制：wl-copy 返回 {r:?}"));
+                    r.is_ok()
+                }
                 Err(e) => {
                     eprintln!("复制失败: {e}");
                     false
@@ -2540,14 +2624,19 @@ fn on_drag_end(s: &mut Session, idx: usize, x: f64, y: f64) {
     // 单击（没拖动）累计：和上一次点击挨得够近够快就是双击 → 完成截图
     if !s.drag.moved {
         let now = std::time::Instant::now();
+        let (mut dt, mut dist) = (0u128, 0.0f64);
         let close = s
             .last_click
             .map(|(t, p)| {
-                now.duration_since(t) < std::time::Duration::from_millis(450)
-                    && (p.0 - x).abs() < 8.0
-                    && (p.1 - y).abs() < 8.0
+                dt = now.duration_since(t).as_millis();
+                dist = (p.0 - x).abs().max((p.1 - y).abs());
+                dt < 450 && dist < 8.0
             })
             .unwrap_or(false);
+        // 双击到底认没认出来，看这条
+        let verdict = if close { "双击" } else { "普通单击" };
+        trace(&format!("单击判定：距上次 {dt} ms、偏 {dist:.0} px → {verdict}"));
+        log_export(&format!("单击判定：距上次 {dt} ms、偏 {dist:.0} px → {verdict}"));
         s.last_click = Some((now, (x, y)));
         if close && s.doc.borrow().sel.is_some() {
             s.drag.moved = false;
@@ -2556,6 +2645,7 @@ fn on_drag_end(s: &mut Session, idx: usize, x: f64, y: f64) {
         }
     }
 
+    trace(&format!("没算单击判定：moved={}", s.drag.moved));
     s.drag.moved = false;
     s.sync_ui();
 }

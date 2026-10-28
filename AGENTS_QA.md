@@ -351,3 +351,24 @@ echo never | sudo tee /sys/kernel/mm/transparent_hugepage/defrag
 表现就是**单击就确认了截图**（配上「按下复制立刻收窗口」之后更明显：屏幕唰地一下
 就没了）。修法是在 `on_drag_end` 最前面拦住：拖拽状态已经是 `None` 就直接返回。
 兜底那条本来就先判了 `kind`，只有 `drag_end` 这条漏了。
+
+## 双击确认会崩：隐藏窗口被手势重入，RefCell 双重借用
+
+现象：「窗口消失了，但什么都没复制」。而这台机器上浮层是热键拉起来的，stderr
+没人看，所以看起来像「静默失败」。
+
+真凶：兜底的 `GestureClick::released` 先拿到事件，借住会话（`sess.borrow_mut()`）；
+里面判定双击 → `do_copy` → **同步 `hide_windows()`** → 把窗口 unmap 掉会掐掉正在
+进行的拖动，GTK 在**同一个调用栈里**重入 `drag_end` 回调 → 它又要
+`sess.borrow_mut()` → already borrowed → panic → 而这是 `extern "C"` 回调，
+panic 不能 unwind → **abort**。
+
+两条修法：
+
+- **隐藏窗口必须丢到下一轮主循环**（`glib::idle_add_local_once`）再做，绝不能在
+  信号回调里同步 unmap。
+- 三个手势闭包和兜底都改用 `try_borrow_mut()`，借不到就跳过——信号回调里 panic
+  等于直接 abort，宁可丢一个事件。
+
+排查这类问题先看 `$XDG_RUNTIME_DIR/focus-snaps.log`：复制/保存链路的关键步骤和
+panic 都会写进去（不用设环境变量，热键拉起来也能事后看）。
