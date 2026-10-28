@@ -248,6 +248,11 @@ pub(crate) fn trace(msg: &str) {
 /// 位置：`$FOCUSSNAPS_LOG`，没设就是 `$XDG_RUNTIME_DIR/focus-snaps.log`。
 pub(crate) fn log_export(msg: &str) {
     use std::io::Write;
+    // 平时不写文件：这类日志是排查「窗口没了却没复制」这种问题时才用的。
+    // 设 FOCUSSNAPS_LOG=<路径>，或者开 FOCUSSNAPS_TRACE，就会落到文件里。
+    if !trace_on() && std::env::var_os("FOCUSSNAPS_LOG").is_none() {
+        return;
+    }
     static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let path = PATH.get_or_init(|| {
         std::env::var("FOCUSSNAPS_LOG").unwrap_or_else(|_| {
@@ -2654,7 +2659,6 @@ fn on_drag_end(s: &mut Session, idx: usize, x: f64, y: f64) {
         }
     }
 
-    trace(&format!("没算单击判定：moved={}", s.drag.moved));
     s.drag.moved = false;
     s.sync_ui();
 }

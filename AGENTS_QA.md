@@ -370,5 +370,6 @@ panic 不能 unwind → **abort**。
 - 三个手势闭包和兜底都改用 `try_borrow_mut()`，借不到就跳过——信号回调里 panic
   等于直接 abort，宁可丢一个事件。
 
-排查这类问题先看 `$XDG_RUNTIME_DIR/focus-snaps.log`：复制/保存链路的关键步骤和
-panic 都会写进去（不用设环境变量，热键拉起来也能事后看）。
+排查这类问题看 `$XDG_RUNTIME_DIR/focus-snaps.log`：panic 无条件记进去（热键拉起来
+也能事后看），复制/保存链路的关键步骤则要设 `FOCUSSNAPS_LOG=<路径>` 或开
+`FOCUSSNAPS_TRACE` 才会写。

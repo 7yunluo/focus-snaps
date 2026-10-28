@@ -435,7 +435,7 @@ pub fn draw_stroke(cr: &cairo::Context, outs: &mut [OutputLayer], s: &Stroke) {
                 cr.set_source_rgba(r, g, b, 1.0);
                 cr.move_to(s.points[0].0, s.points[0].1);
                 show_layout(cr, &layout);
-                let _ = cr.new_path();
+                cr.new_path();
                 let _ = cr.restore();
             }
         }
@@ -455,7 +455,7 @@ pub fn draw_stroke(cr: &cairo::Context, outs: &mut [OutputLayer], s: &Stroke) {
                 y - th as f64 / 2.0,
             );
             show_layout(cr, &layout);
-            let _ = cr.new_path();
+            cr.new_path();
             let _ = cr.restore();
         }
         Tool::Select => {}
