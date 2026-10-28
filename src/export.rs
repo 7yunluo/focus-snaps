@@ -6,13 +6,22 @@ use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
 
-use crate::doc::Doc;
+use crate::doc::{intersect, Doc};
 use crate::paint::draw_stroke;
 
 /// 把抓屏得到的 BGRA 像素包成画布
 pub fn surface_from_bgra(width: u32, height: u32, pixels: &[u8]) -> Result<cairo::ImageSurface, String> {
     let w = width as i32;
     let h = height as i32;
+    // 像素长度不够就直接报错，别在下面按下标切
+    if pixels.len() < width as usize * height as usize * 4 {
+        return Err(format!(
+            "像素长度不足：{} < {}x{}x4",
+            pixels.len(),
+            width,
+            height
+        ));
+    }
     let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h)
         .map_err(|e| format!("创建画布失败: {e}"))?;
     {
@@ -36,46 +45,139 @@ pub fn surface_from_bgra(width: u32, height: u32, pixels: &[u8]) -> Result<cairo
     Ok(surface)
 }
 
-/// 渲染一段区域：逻辑坐标 (x0,y0,x1,y1) → 按物理分辨率输出
-fn render_rect(
-    doc: &mut Doc,
-    out_idx: usize,
-    r: (f64, f64, f64, f64),
-) -> Result<cairo::ImageSurface, String> {
+/// 把零拷贝抓屏的显存缓冲直接导成 GPU 纹理
+///
+/// 不用 CPU 读回，也不用把 44 MB 上传到显存：合成器已经写在这块显存里了。
+pub fn dmabuf_texture(buf: &crate::dmabuf::Buffer) -> Result<gdk::Texture, String> {
+    use std::os::fd::AsRawFd;
+    let display = gdk::Display::default().ok_or("拿不到 GDK display")?;
+    let builder = gdk::DmabufTextureBuilder::new()
+        .set_display(&display)
+        .set_width(buf.width)
+        .set_height(buf.height)
+        .set_fourcc(buf.format)
+        .set_modifier(buf.modifier)
+        .set_n_planes(1)
+        .set_offset(0, 0)
+        .set_stride(0, buf.stride)
+        // 抓屏出来的 alpha 都是 255，按预乘处理与直通一致
+        .set_premultiplied(true);
+    // SAFETY: 缓冲由调用方（OutputLayer.dmabuf）一直持有，
+    // 纹理活多久这块显存就活多久
+    let built = unsafe { builder.set_fd(0, buf.prime.as_raw_fd()).build() };
+    built.map_err(|e| format!("显存缓冲导成纹理失败: {e}"))
+}
+
+/// 从纹理把像素要回来（GPU 侧的一次拷贝，DP-1 上 40 ms）
+///
+/// 只在「用户已经要结果了」的时候用：平时像素由后台线程从显存里慢慢读
+/// （write-combined 映射，接近 1 秒），完全不占主线程；但按了复制/保存就是在
+/// 等结果，这时候换一次几十毫秒的停顿划算得多。
+pub fn pixels_from_texture(texture: &gdk::Texture) -> Result<(Vec<u8>, i32, i32), String> {
+    let mut downloader = gdk::TextureDownloader::new(texture);
+    downloader.set_format(gdk::MemoryFormat::B8g8r8a8Premultiplied);
+    let (bytes, stride) = downloader.download_bytes();
+    let format = downloader.format();
+    let (w, h) = (texture.width(), texture.height());
+    let row = w as usize * 4;
+    let data = bytes.as_ref();
+    let mut out = Vec::with_capacity(row * h as usize);
+    for y in 0..h as usize {
+        let start = y * stride;
+        let line = data.get(start..start + row).ok_or("下载的像素长度不够")?;
+        if format == gdk::MemoryFormat::B8g8r8a8Premultiplied {
+            out.extend_from_slice(line);
+        } else {
+            // 拿不到 BGRA 就按 RGBA 处理，顺手换回来
+            for px in line.chunks_exact(4) {
+                out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+        }
+    }
+    Ok((out, w, h))
+}
+
+/// 把紧密排列的 BGRA 像素直接包成画布，不拷贝
+pub fn surface_from_bgra_owned(pixels: Vec<u8>, width: u32, height: u32) -> Result<cairo::ImageSurface, String> {
+    let (w, h) = (width as i32, height as i32);
+    let stride = width as usize * 4;
+    if pixels.len() < stride * height as usize {
+        return Err(format!("像素长度不足：{} < {}x{}x4", pixels.len(), width, height));
+    }
+    cairo::ImageSurface::create_for_data(pixels, cairo::Format::ARgb32, w, h, stride as i32)
+        .map_err(|e| format!("画布接管像素失败: {e}"))
+}
+
+/// 抓屏的 BGRA 像素包成纹理，自己拷一份（像素还得留给识别窗口用）
+pub fn texture_from_bgra(pixels: &[u8], w: i32, h: i32) -> gdk::Texture {
+    let bytes = glib::Bytes::from(pixels);
+    gdk::MemoryTexture::new(
+        w,
+        h,
+        gdk::MemoryFormat::B8g8r8a8Premultiplied,
+        &bytes,
+        (w as usize) * 4,
+    )
+    .upcast()
+}
+
+/// 渲染选区：跨屏时把各屏画面在物理像素上拼成一张整图
+pub fn render_selection(doc: &mut Doc) -> Result<cairo::ImageSurface, String> {
+    let sel = doc.sel.ok_or("还没有选区")?.normalized();
     let Doc { outs, strokes, .. } = doc;
-    let Some(out) = outs.get_mut(out_idx) else {
-        return Err("选区所属的显示器已失效".into());
-    };
-    // 夹到显示器范围内，并对齐到物理像素边界，避免整图重采样
-    let x0 = r.0.max(0.0);
-    let y0 = r.1.max(0.0);
-    let x1 = r.2.min(out.size.0).max(x0 + 1.0);
-    let y1 = r.3.min(out.size.1).max(y0 + 1.0);
-    let px0 = (x0 * out.sx).round();
-    let py0 = (y0 * out.sy).round();
-    let pw = ((x1 * out.sx).round() - px0).max(1.0) as i32;
-    let ph = ((y1 * out.sy).round() - py0).max(1.0) as i32;
-    let lw = (x1 - x0).max(0.1);
-    let lh = (y1 - y0).max(0.1);
+
+    // 逐屏算出跟选区的交集；参考缩放取最大的一档，避免把画面降采样
+    let mut hits = Vec::new();
+    let (mut kx, mut ky) = (0.0f64, 0.0f64);
+    for (i, o) in outs.iter().enumerate() {
+        if let Some(r) = intersect(sel, o.rect()) {
+            hits.push((i, r));
+            kx = kx.max(o.sx);
+            ky = ky.max(o.sy);
+        }
+    }
+    if hits.is_empty() {
+        return Err("选区不在任何显示器上".into());
+    }
+    let lw = (sel.2 - sel.0).max(0.1);
+    let lh = (sel.3 - sel.1).max(0.1);
+    let pw = ((lw * kx).round().max(1.0)) as i32;
+    let ph = ((lh * ky).round().max(1.0)) as i32;
     let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, pw, ph)
         .map_err(|e| format!("创建输出画布失败: {e}"))?;
     {
         let cr = cairo::Context::new(&surface).map_err(|e| format!("建立绘图上下文失败: {e}"))?;
-        // 底图：物理像素 1:1 贴到画布左上角
-        let _ = cr.save();
-        cr.translate(-px0, -py0);
-        let pat = cairo::SurfacePattern::create(&out.phys);
-        pat.set_filter(cairo::Filter::Nearest);
-        if cr.set_source(&pat).is_ok() {
-            let _ = cr.paint();
+
+        // 底图：每块屏把自己那一段贴到画布上对应的位置
+        for (i, r) in &hits {
+            let o = &mut outs[*i];
+            let (origin, sx, sy) = (o.origin, o.sx, o.sy);
+            // 画面还没抓回来的屏就没底图可贴，只剩标注
+            let Some(phys) = o.ensure_phys() else {
+                continue;
+            };
+            let px0 = ((r.0 - origin.0) * sx).round();
+            let py0 = ((r.1 - origin.1) * sy).round();
+            let _ = cr.save();
+            cr.translate((r.0 - sel.0) * kx, (r.1 - sel.1) * ky);
+            cr.scale(kx / sx, ky / sy);
+            cr.translate(-px0, -py0);
+            let pat = cairo::SurfacePattern::create(phys);
+            pat.set_filter(cairo::Filter::Nearest);
+            if cr.set_source(&pat).is_ok() {
+                let _ = cr.paint();
+            }
+            let _ = cr.restore();
         }
-        let _ = cr.restore();
-        // 标注：逻辑坐标映射到同一张画布
+
+        // 标注：全局逻辑坐标映射到同一张画布
         let _ = cr.save();
-        cr.scale(pw as f64 / lw, ph as f64 / lh);
-        cr.translate(-x0, -y0);
+        cr.scale(kx, ky);
+        cr.translate(-sel.0, -sel.1);
+        cr.rectangle(sel.0, sel.1, sel.2 - sel.0, sel.3 - sel.1);
+        cr.clip();
         for s in strokes.iter() {
-            draw_stroke(&cr, out, s);
+            draw_stroke(&cr, outs, s);
         }
         let _ = cr.restore();
         let _ = cr.show_page();
@@ -84,58 +186,61 @@ fn render_rect(
     Ok(surface)
 }
 
-/// 渲染当前选区
-pub fn render_selection(doc: &mut Doc) -> Result<cairo::ImageSurface, String> {
-    let sel = doc.sel.ok_or("还没有选区")?;
-    render_rect(doc, sel.out, sel.normalized())
-}
-
-/// 画布转 RGBA8 字节
-fn surface_rgba(surface: &mut cairo::ImageSurface) -> Result<(Vec<u8>, i32, i32), String> {
+/// 画布转 RGBA 像素
+///
+/// 通道顺序要换一下（cairo 的 ARGB32 在内存里是 BGRX）。按 4 字节一组整块处理，
+/// 比逐像素按下标读写快得多，整屏 1100 万像素也就十几毫秒。
+pub fn surface_rgba(surface: &mut cairo::ImageSurface) -> Result<(Vec<u8>, i32, i32), String> {
     let w = surface.width() as usize;
     let h = surface.height() as usize;
     let stride = surface.stride() as usize;
     let data = surface.data().map_err(|e| format!("读取画布失败: {e}"))?;
     let mut out = vec![0u8; w * h * 4];
     for y in 0..h {
-        let src = y * stride;
-        let dst = y * w * 4;
-        let srow = &data[src..src + w * 4];
-        let drow = &mut out[dst..dst + w * 4];
-        for x in 0..w {
-            let i = x * 4;
-            drow[i] = srow[i + 2];
-            drow[i + 1] = srow[i + 1];
-            drow[i + 2] = srow[i];
-            drow[i + 3] = srow[i + 3];
+        let srow = &data[y * stride..y * stride + w * 4];
+        let drow = &mut out[y * w * 4..(y + 1) * w * 4];
+        for (s, d) in srow.chunks_exact(4).zip(drow.chunks_exact_mut(4)) {
+            d[0] = s[2];
+            d[1] = s[1];
+            d[2] = s[0];
+            d[3] = s[3];
         }
     }
     Ok((out, w as i32, h as i32))
 }
 
-/// 编码 PNG
-pub fn encode_png(surface: &mut cairo::ImageSurface) -> Result<Vec<u8>, String> {
+/// 从 RGBA 像素编码 PNG，不碰任何 GTK 对象，可以丢到别的线程上跑
+pub fn encode_png_rgba(rgba: &[u8], w: i32, h: i32) -> Result<Vec<u8>, String> {
     use image::ImageEncoder;
-    let (rgba, w, h) = surface_rgba(surface)?;
     let mut out = Vec::new();
     image::codecs::png::PngEncoder::new(&mut out)
-        .write_image(&rgba, w as u32, h as u32, image::ExtendedColorType::Rgba8)
+        .write_image(rgba, w as u32, h as u32, image::ExtendedColorType::Rgba8)
         .map_err(|e| format!("编码 PNG 失败: {e}"))?;
     Ok(out)
 }
 
-/// 画布转剪贴板纹理
-pub fn surface_texture(surface: &mut cairo::ImageSurface) -> Result<gdk::Texture, String> {
+/// 编码 PNG
+pub fn encode_png(surface: &mut cairo::ImageSurface) -> Result<Vec<u8>, String> {
     let (rgba, w, h) = surface_rgba(surface)?;
-    let bytes = glib::Bytes::from(&rgba);
-    Ok(gdk::MemoryTexture::new(
+    encode_png_rgba(&rgba, w, h)
+}
+
+/// RGBA 像素转剪贴板纹理
+pub fn texture_from_rgba(rgba: &[u8], w: i32, h: i32) -> Result<gdk::Texture, String> {
+    Ok(texture_from_rgba_owned(rgba.to_vec(), w, h))
+}
+
+/// 同上，但接管这块像素的所有权，省掉一次整屏拷贝
+pub fn texture_from_rgba_owned(rgba: Vec<u8>, w: i32, h: i32) -> gdk::Texture {
+    let bytes = glib::Bytes::from_owned(rgba);
+    gdk::MemoryTexture::new(
         w,
         h,
         gdk::MemoryFormat::R8g8b8a8,
         &bytes,
         (w as usize) * 4,
     )
-    .upcast())
+    .upcast()
 }
 
 fn stamp() -> String {
@@ -160,6 +265,17 @@ pub fn save_to_dir(surface: &mut cairo::ImageSurface, dir: &str) -> Result<PathB
     std::fs::create_dir_all(dir).map_err(|e| format!("创建目录失败: {e}"))?;
     let path = unique_path(Path::new(dir), &stamp());
     let bytes = encode_png(surface)?;
+    std::fs::write(&path, bytes).map_err(|e| format!("写入文件失败: {e}"))?;
+    Ok(path)
+}
+
+/// 把 RGBA 像素编码后落到图片目录，返回落盘路径
+///
+/// 和 save_to_dir 等价，只是不依赖 cairo 画布，可以拿到后台线程上跑。
+pub fn save_rgba_png(rgba: &[u8], w: i32, h: i32, dir: &str) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    let path = unique_path(Path::new(dir), &stamp());
+    let bytes = encode_png_rgba(rgba, w, h)?;
     std::fs::write(&path, bytes).map_err(|e| format!("写入文件失败: {e}"))?;
     Ok(path)
 }
@@ -214,7 +330,7 @@ mod tests {
     use crate::doc::OutputLayer;
 
     /// 造一块 (逻辑宽, 逻辑高, 缩放) 的显示器画面，R 通道编码 x、G 通道编码 y
-    fn layer(lw: i32, lh: i32, sx: f64, sy: f64) -> OutputLayer {
+    fn layer_at(origin: (f64, f64), lw: i32, lh: i32, sx: f64, sy: f64) -> OutputLayer {
         let pw = (lw as f64 * sx).round() as i32;
         let ph = (lh as f64 * sy).round() as i32;
         let mut phys = cairo::ImageSurface::create(cairo::Format::ARgb32, pw, ph).unwrap();
@@ -232,14 +348,36 @@ mod tests {
             }
         }
         phys.mark_dirty();
-        OutputLayer::new((lw as f64, lh as f64), sx, sy, phys, Vec::new())
+        OutputLayer::new(
+            origin,
+            (lw as f64, lh as f64),
+            sx,
+            sy,
+            phys,
+            Vec::new(),
+        )
+    }
+
+    fn layer(lw: i32, lh: i32, sx: f64, sy: f64) -> OutputLayer {
+        layer_at((0.0, 0.0), lw, lh, sx, sy)
+    }
+
+    /// 直接按选区渲染
+    fn render(doc: &mut Doc, sel: (f64, f64, f64, f64)) -> cairo::ImageSurface {
+        doc.sel = Some(crate::doc::Selection {
+            x0: sel.0,
+            y0: sel.1,
+            x1: sel.2,
+            y1: sel.3,
+        });
+        render_selection(doc).unwrap()
     }
 
     #[test]
     fn render_rect_maps_physical_pixels_exactly() {
         // 逻辑 40x20，2 倍缩放 → 物理 80x40
         let mut doc = Doc::new(vec![layer(40, 20, 2.0, 2.0)], "/tmp".into());
-        let mut out = render_rect(&mut doc, 0, (10.0, 5.0, 20.0, 10.0)).unwrap();
+        let mut out = render(&mut doc, (10.0, 5.0, 20.0, 10.0));
         // 选区 10x5 逻辑 → 20x10 物理
         assert_eq!((out.width(), out.height()), (20, 10));
         let (rgba, w, _) = surface_rgba(&mut out).unwrap();
@@ -257,13 +395,37 @@ mod tests {
     fn render_rect_handles_fractional_scale() {
         // 逻辑 100x50，1.4 倍 → 物理 140x70
         let mut doc = Doc::new(vec![layer(100, 50, 1.4, 1.4)], "/tmp".into());
-        let mut out = render_rect(&mut doc, 0, (10.0, 10.0, 60.0, 40.0)).unwrap();
+        let mut out = render(&mut doc, (10.0, 10.0, 60.0, 40.0));
         assert_eq!((out.width(), out.height()), (70, 42));
         let (rgba, w, _) = surface_rgba(&mut out).unwrap();
         let px = |x: usize, y: usize, c: usize| rgba[(y * w as usize + x) * 4 + c] as f64;
         // 物理起点 10*1.4=14，+0.5 采样偏移
         assert!((px(0, 0, 0) - 14.5).abs() <= 2.0, "R={}", px(0, 0, 0));
         assert!((px(0, 0, 1) - 14.5).abs() <= 2.0, "G={}", px(0, 0, 1));
+    }
+
+    #[test]
+    fn render_selection_stitches_outputs() {
+        // 两块 40x20 逻辑、2 倍缩放的屏并排，横跨两屏选一条带
+        let mut doc = Doc::new(
+            vec![
+                layer_at((0.0, 0.0), 40, 20, 2.0, 2.0),
+                layer_at((40.0, 0.0), 40, 20, 2.0, 2.0),
+            ],
+            "/tmp".into(),
+        );
+        let mut out = render(&mut doc, (30.0, 5.0, 50.0, 15.0));
+        // 20 逻辑宽 → 40 物理宽，10 逻辑高 → 20 物理高
+        assert_eq!((out.width(), out.height()), (40, 20));
+        let (rgba, w, _) = surface_rgba(&mut out).unwrap();
+        let px = |x: usize, y: usize, c: usize| rgba[(y * w as usize + x) * 4 + c] as i32;
+        // 左半段来自第一块屏：物理 x 从 60 起，y 从 10 起
+        assert!((px(0, 0, 0) - 60).abs() <= 1, "左半 R={}", px(0, 0, 0));
+        assert!((px(0, 0, 1) - 10).abs() <= 1, "左半 G={}", px(0, 0, 1));
+        // 右半段来自第二块屏，它的本地 x 从 0 重新开始
+        assert!((px(20, 0, 0) - 0).abs() <= 1, "右半 R={}", px(20, 0, 0));
+        assert!((px(39, 19, 0) - 19).abs() <= 1, "右半末 R={}", px(39, 19, 0));
+        assert!(rgba.chunks_exact(4).all(|p| p[3] == 255));
     }
 
     #[test]

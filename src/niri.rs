@@ -20,6 +20,25 @@ pub struct WinInfo {
     pub tile_size: (f64, f64),
 }
 
+thread_local! {
+    /// 一次启动里每块屏都要这份窗口列表，别为了每块屏 fork 两次 niri
+    static SNAPSHOT: std::cell::RefCell<Option<(serde_json::Value, serde_json::Value)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 工作区与窗口列表，整个进程只取一次
+fn snapshot() -> Option<(serde_json::Value, serde_json::Value)> {
+    SNAPSHOT.with(|c| {
+        let mut slot = c.borrow_mut();
+        if slot.is_none() {
+            let ws = run_json(&["msg", "--json", "workspaces"])?;
+            let windows = run_json(&["msg", "--json", "windows"])?;
+            *slot = Some((ws, windows));
+        }
+        slot.clone()
+    })
+}
+
 fn run_json(args: &[&str]) -> Option<serde_json::Value> {
     let out = Command::new("niri").args(args).output().ok()?;
     if !out.status.success() {
@@ -30,7 +49,7 @@ fn run_json(args: &[&str]) -> Option<serde_json::Value> {
 
 /// 取某块显示器上当前活动工作区的窗口列表
 pub fn active_workspace_windows(output: &str) -> Option<Vec<WinInfo>> {
-    let workspaces = run_json(&["msg", "--json", "workspaces"])?;
+    let (workspaces, windows) = snapshot()?;
     let ws_id = workspaces
         .as_array()?
         .iter()
@@ -39,7 +58,6 @@ pub fn active_workspace_windows(output: &str) -> Option<Vec<WinInfo>> {
         })
         .and_then(|w| w["id"].as_u64())?;
 
-    let windows = run_json(&["msg", "--json", "windows"])?;
     let mut out = Vec::new();
     for w in windows.as_array()? {
         if w["workspace_id"].as_u64() != Some(ws_id) {
@@ -80,10 +98,42 @@ pub fn active_workspace_windows(output: &str) -> Option<Vec<WinInfo>> {
     Some(out)
 }
 
+/// 每块屏幕的逻辑尺寸（合成器视角）
+///
+/// GDK 报的显示器几何是 round(物理/缩放)，和合成器自己按输出算出来的逻辑尺寸
+/// 可能差一个逻辑像素（DP-1 上 GDK 说 3793，niri 说 3792）。差这一像素，
+/// 我们这块铺满整屏的浮层就会被合成器整屏重采样一次。
+pub fn outputs_logical() -> Option<Vec<(String, (i32, i32))>> {
+    let v = run_json(&["msg", "--json", "outputs"])?;
+    let mut out = Vec::new();
+    for (name, o) in v.as_object()? {
+        let l = &o["logical"];
+        let (w, h) = (l["width"].as_i64()?, l["height"].as_i64()?);
+        out.push((name.clone(), (w as i32, h as i32)));
+    }
+    Some(out)
+}
+
 /// 当前焦点显示器的名字
 pub fn focused_output() -> Option<String> {
     let v = run_json(&["msg", "--json", "focused-output"])?;
     Some(v["name"].as_str()?.to_string())
+}
+
+/// 在后台盯着焦点显示器，被切到别处就抢回来
+///
+/// 每次轮询都要 fork/exec 一次 `niri msg`（实测 4 ms 上下，负载高时更久），
+/// 放在主线程上等于每 500 ms 吃掉一帧的预算，整段必须丢到独立线程里。
+/// 进程退出时线程跟着没，不需要收拾。
+pub fn keep_focus_in_background(want: String) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if let Some(cur) = focused_output() {
+            if cur != want {
+                focus_output(&want);
+            }
+        }
+    });
 }
 
 /// 把键盘焦点切到指定显示器

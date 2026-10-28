@@ -3,79 +3,116 @@ use gtk::cairo;
 use gtk::pango;
 use pangocairo::functions::{create_layout, show_layout};
 
-use crate::doc::{Doc, OutputLayer, Stroke, Tool};
+use crate::doc::{intersect, Doc, OutputLayer, Rect4, Stroke, Tool};
 
 /// 选区外压暗的强度
-const DIM: f64 = 0.45;
+pub const DIM: f64 = 0.45;
 /// 手柄边长（逻辑像素）
 pub const HANDLE: f64 = 7.0;
 /// 手柄命中半径（逻辑像素）
 pub const HANDLE_HIT: f64 = 9.0;
 
-/// 画一个显示器的整块浮层，area 是窗口的实际逻辑尺寸
+/// 标注层四周的余量（逻辑像素）：手柄和边框伸出去的那点
+pub const ANNOT_PAD: f64 = 10.0;
+/// 上方还要留出尺寸徽标的位置
+///
+/// 标注层每次重画都要把整层当纹理传一遍，层越小每帧申请的内存越少，
+/// 所以除了徽标要的那点高度，其余三边只留手柄伸出去的量。
+pub const ANNOT_PAD_TOP: f64 = 34.0;
+
+/// 标注层需要覆盖的范围（本屏局部坐标）
+///
+/// 只画会画出东西的那一块：选区（或悬停窗口）加余量，再裁进本屏。
+/// 返回 None 表示这屏上什么都不用画，图层可以整个藏起来。
+pub fn annot_rect(live: Option<Rect4>, out_rect: Rect4) -> Option<Rect4> {
+    let r = intersect(live?, out_rect)?;
+    // 尺寸徽标放得下就在选区上方，放不下会挪到下方，只有它会伸出去
+    let (pad_top, pad_bottom) = if r.1 - out_rect.1 >= ANNOT_PAD_TOP {
+        (ANNOT_PAD_TOP, ANNOT_PAD)
+    } else {
+        (ANNOT_PAD, ANNOT_PAD_TOP)
+    };
+    let x0 = (r.0 - ANNOT_PAD).max(out_rect.0);
+    let y0 = (r.1 - pad_top).max(out_rect.1);
+    let x1 = (r.2 + ANNOT_PAD).min(out_rect.2);
+    let y1 = (r.3 + pad_bottom).min(out_rect.3);
+    let local = (
+        x0 - out_rect.0,
+        y0 - out_rect.1,
+        x1 - out_rect.0,
+        y1 - out_rect.1,
+    );
+    if local.2 > local.0 && local.3 > local.1 {
+        Some(local)
+    } else {
+        None
+    }
+}
+
+/// 亮洞的范围（本屏局部坐标）
+///
+/// 跟标注层不一样，这里**不加余量**：洞的外面就是压暗，边界得和选区严丝合缝。
+/// 返回 None 表示这屏上没有洞，那块控件可以藏起来（洞藏在压暗层后面就等于没洞）。
+pub fn hole_rect(live: Option<Rect4>, out_rect: Rect4) -> Option<Rect4> {
+    let r = intersect(live?, out_rect)?;
+    let local = (
+        r.0 - out_rect.0,
+        r.1 - out_rect.1,
+        r.2 - out_rect.0,
+        r.3 - out_rect.1,
+    );
+    if local.2 > local.0 && local.3 > local.1 {
+        Some(local)
+    } else {
+        None
+    }
+}
+
+/// 画一个显示器上随交互变化的那一层：悬停框、标注、选区边框
+///
+/// 屏幕画面在下层由 GtkPicture 合成、压暗由 CSS 矩形铺、亮洞由 hole 控件贴纹理，
+/// 这里都不管。
+///
+/// 选区、标注都存在全局逻辑坐标里。`view` 是这张画布左上角的全局坐标：
+/// 画布只覆盖会画出东西的那块地方（选区加上一点余量），不用铺满整屏。
 pub fn paint(
     cr: &cairo::Context,
     doc: &mut Doc,
     out_idx: usize,
-    area: (f64, f64),
+    view: (f64, f64),
     preview: Option<(f64, f64, &str)>,
 ) {
+    // 本屏的参数先拷出来，后面要可变借用文档
+    let (origin, size, sx, sy, out_rect) = match doc.outs.get(out_idx) {
+        Some(o) => (o.origin, o.size, o.sx, o.sy, o.rect()),
+        None => return,
+    };
+    let sel = doc.sel.map(|s| s.normalized());
+    let hover = doc.hover.as_ref().map(|r| (r.x0, r.y0, r.x1, r.y1));
+    // 尺寸徽标只在选区左上角所在的那块屏上画
+    let owner = sel.map(|s| doc.out_at(s.0, s.1)) == Some(Some(out_idx));
+
     let Doc {
         outs,
-        sel,
         strokes,
         active,
         tool,
-        hover,
-        text_sel,
         width,
         accent,
+        text_sel,
         ..
     } = doc;
-    let Some(out) = outs.get_mut(out_idx) else {
-        return;
-    };
 
-    // 画面按物理分辨率 1:1 贴到设备像素，避免二次采样发虚
+    // 之后统一按全局逻辑坐标画，只是把原点挪到画布左上角
     let _ = cr.save();
-    cr.scale(1.0 / out.sx, 1.0 / out.sy);
-    let _ = cr.set_source_surface(&out.phys, 0.0, 0.0);
-    let _ = cr.paint();
-    let _ = cr.restore();
-
-    let sel = sel
-        .filter(|s| s.out == out_idx)
-        .map(|s| s.normalized());
-
-    // 悬停的窗口先用它当「洞」，让用户看清将选中哪一块
-    let hover_rect = hover
-        .as_ref()
-        .filter(|(o, _)| *o == out_idx)
-        .map(|(_, r)| (r.x0, r.y0, r.x1, r.y1));
-
-    // 选区外（或悬停窗口外）压暗
-    cr.set_source_rgba(0.0, 0.0, 0.0, DIM);
-    match sel.or(hover_rect) {
-        Some((x0, y0, x1, y1)) => {
-            let (w, h) = area;
-            quad(cr, 0.0, 0.0, w, y0);
-            quad(cr, 0.0, y1, w, h - y1);
-            quad(cr, 0.0, y0, x0, y1 - y0);
-            quad(cr, x1, y0, w - x1, y1 - y0);
-            let _ = cr.fill();
-        }
-        None => {
-            let _ = cr.paint();
-        }
-    }
+    cr.translate(-view.0, -view.1);
 
     let Some((x0, y0, x1, y1)) = sel else {
         // 还没框选时，把指针悬停的窗口勾出来
-        if let Some((o, r)) = hover.as_ref() {
-            if *o == out_idx {
-                draw_hover(cr, r, *accent);
-            }
+        if let Some(h) = hover.filter(|h| intersect(*h, out_rect).is_some()) {
+            draw_hover(cr, h, *accent);
         }
+        let _ = cr.restore();
         return;
     };
 
@@ -84,10 +121,10 @@ pub fn paint(
     cr.rectangle(x0, y0, x1 - x0, y1 - y0);
     cr.clip();
     for s in strokes.iter() {
-        draw_stroke(cr, out, s);
+        draw_stroke(cr, outs, s);
     }
     if let Some(a) = active.as_ref() {
-        draw_stroke(cr, out, a);
+        draw_stroke(cr, outs, a);
     }
     // 正在输入的文字由输入框原地显示，这里只框出它的范围
     if let Some((px, py, text)) = preview {
@@ -100,22 +137,25 @@ pub fn paint(
     let _ = cr.restore();
 
     draw_frame(cr, (x0, y0, x1, y1), *tool == Tool::Select, *accent);
-    draw_badge(cr, out, (x0, y0, x1, y1));
     draw_text_frame(cr, strokes, *text_sel, *accent);
-}
+    let _ = cr.restore();
 
-fn quad(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64) {
-    if w > 0.0 && h > 0.0 {
-        cr.rectangle(x, y, w, h);
+    if owner {
+        // 徽标按本屏局部坐标摆才不会算错贴边，所以先切回屏幕坐标再画
+        let _ = cr.save();
+        cr.translate(origin.0 - view.0, origin.1 - view.1);
+        draw_badge(cr, (x0 - origin.0, y0 - origin.1, x1 - origin.0, y1 - origin.1), size, (sx, sy));
+        let _ = cr.restore();
     }
 }
 
-/// 悬停窗口的高亮框
-fn draw_hover(cr: &cairo::Context, r: &crate::windows::Rect, accent: (f64, f64, f64)) {
+/// 悬停窗口的高亮框（全局逻辑坐标）
+fn draw_hover(cr: &cairo::Context, r: Rect4, accent: (f64, f64, f64)) {
+    let (x0, y0, x1, y1) = r;
     let _ = cr.save();
     cr.set_source_rgba(accent.0, accent.1, accent.2, 0.95);
     cr.set_line_width(2.0);
-    cr.rectangle(r.x0, r.y0, r.width(), r.height());
+    cr.rectangle(x0, y0, x1 - x0, y1 - y0);
     let _ = cr.stroke();
     let _ = cr.restore();
 }
@@ -196,10 +236,15 @@ pub fn handle_points(r: (f64, f64, f64, f64)) -> [(f64, f64); 8] {
 }
 
 /// 选区尺寸徽标，显示物理像素
-fn draw_badge(cr: &cairo::Context, out: &OutputLayer, r: (f64, f64, f64, f64)) {
+fn draw_badge(
+    cr: &cairo::Context,
+    r: Rect4,
+    size: (f64, f64),
+    scale: (f64, f64),
+) {
     let (x0, y0, x1, y1) = r;
-    let wpx = ((x1 - x0) * out.sx).round() as i64;
-    let hpx = ((y1 - y0) * out.sy).round() as i64;
+    let wpx = ((x1 - x0) * scale.0).round() as i64;
+    let hpx = ((y1 - y0) * scale.1).round() as i64;
     let label = format!("{wpx} × {hpx}");
     let layout = text_layout(cr, &label, 13.0, false);
     let (tw, th) = layout.pixel_size();
@@ -207,13 +252,13 @@ fn draw_badge(cr: &cairo::Context, out: &OutputLayer, r: (f64, f64, f64, f64)) {
     let bw = tw as f64 + pad * 2.0;
     let bh = th as f64 + 6.0;
     // 优先放在选区上方，其次下方，都放不下就压进选区内部并保证不出界
-    let bx = x0.clamp(2.0, (out.size.0 - bw - 2.0).max(2.0));
+    let bx = x0.clamp(2.0, (size.0 - bw - 2.0).max(2.0));
     let by = if y0 - bh - 6.0 >= 2.0 {
         y0 - bh - 6.0
-    } else if y1 + 6.0 + bh <= out.size.1 - 2.0 {
+    } else if y1 + 6.0 + bh <= size.1 - 2.0 {
         y1 + 6.0
     } else {
-        (y0 + 6.0).clamp(2.0, (out.size.1 - bh - 2.0).max(2.0))
+        (y0 + 6.0).clamp(2.0, (size.1 - bh - 2.0).max(2.0))
     };
 
     let _ = cr.save();
@@ -279,8 +324,12 @@ pub fn text_size(surface: &cairo::ImageSurface, text: &str, px: f64) -> Option<(
     Some((f64::from(w), f64::from(h)))
 }
 
-/// 画一笔标注
-pub fn draw_stroke(cr: &cairo::Context, out: &mut OutputLayer, s: &Stroke) {
+/// 画一笔标注（全局逻辑坐标）
+pub fn draw_stroke(cr: &cairo::Context, outs: &mut [OutputLayer], s: &Stroke) {
+    // 上一笔可能把路径留在那儿没清（文字/序号里 move_to 过），而 save/restore
+    // 不管路径。arc 会把当前点和弧线起点连起来——不清掉的话，先点个序号再画
+    // 椭圆，就会多出一条从序号连到椭圆的线
+    cr.new_path();
     let (r, g, b) = s.color;
     match s.tool {
         Tool::Brush | Tool::Highlighter => {
@@ -314,7 +363,7 @@ pub fn draw_stroke(cr: &cairo::Context, out: &mut OutputLayer, s: &Stroke) {
             let (x0, y0) = s.points[0];
             let (x1, y1) = s.points[1];
             match s.tool {
-                Tool::Mosaic => paint_mosaic(cr, out, (x0, y0), (x1, y1)),
+                Tool::Mosaic => paint_mosaic(cr, outs, (x0, y0), (x1, y1)),
                 Tool::Crop => {
                     let _ = cr.save();
                     cr.set_source_rgba(r, g, b, 0.9);
@@ -386,6 +435,7 @@ pub fn draw_stroke(cr: &cairo::Context, out: &mut OutputLayer, s: &Stroke) {
                 cr.set_source_rgba(r, g, b, 1.0);
                 cr.move_to(s.points[0].0, s.points[0].1);
                 show_layout(cr, &layout);
+                cr.new_path();
                 let _ = cr.restore();
             }
         }
@@ -405,76 +455,120 @@ pub fn draw_stroke(cr: &cairo::Context, out: &mut OutputLayer, s: &Stroke) {
                 y - th as f64 / 2.0,
             );
             show_layout(cr, &layout);
+            cr.new_path();
             let _ = cr.restore();
         }
         Tool::Select => {}
     }
 }
 
-/// 区域打码：从原画面按块取平均色再填实心方块
-fn paint_mosaic(cr: &cairo::Context, out: &mut OutputLayer, a: (f64, f64), b: (f64, f64)) {
-    let x0 = a.0.min(b.0).max(0.0);
-    let y0 = a.1.min(b.1).max(0.0);
-    let x1 = a.0.max(b.0).min(out.size.0);
-    let y1 = a.1.max(b.1).min(out.size.1);
-    if x1 <= x0 || y1 <= y0 {
-        return;
-    }
-    let stride = out.phys.stride() as usize;
-    let (bw, bh) = (out.phys.width(), out.phys.height());
-    let data = match out.phys.data() {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-    // 块大小随缩放微调，观感上始终是 12 逻辑像素
-    let block = 12.0;
-    let step = 3usize;
+/// 打码块的大小（逻辑像素）
+const MOSAIC_BLOCK: f64 = 12.0;
 
+/// 区域打码：从预计算好的块平均图上贴一块
+///
+/// 块平均图是整屏一次性算出来的（mosaic_image），每帧只是把它按块贴在选区里，
+/// 不再每帧去扫原画面的像素。
+fn paint_mosaic(cr: &cairo::Context, outs: &mut [OutputLayer], a: (f64, f64), b: (f64, f64)) {
+    let want = (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1));
+    for out in outs.iter_mut() {
+        if let Some(r) = intersect(want, out.rect()) {
+            mosaic_piece(cr, out, r);
+        }
+    }
+}
+
+/// 在一部分屏幕上贴打码块，r 是全局逻辑坐标
+fn mosaic_piece(cr: &cairo::Context, out: &mut OutputLayer, r: Rect4) {
+    let origin = mosaic_origin(out);
+    let Some(img) = mosaic_image(out) else {
+        return;
+    };
+    let pat = cairo::SurfacePattern::create(&img);
+    // 一块一个纯色，必须按最近邻放大，不然块边缘会糊
+    pat.set_filter(cairo::Filter::Nearest);
     let _ = cr.save();
-    let mut y = y0;
-    while y < y1 {
-        let mut x = x0;
-        while x < x1 {
-            let px0 = ((x * out.sx).round() as i32).clamp(0, bw - 1) as usize;
-            let py0 = ((y * out.sy).round() as i32).clamp(0, bh - 1) as usize;
-            let px1 = (((x + block) * out.sx).round() as i32).clamp(px0 as i32 + 1, bw) as usize;
-            let py1 = (((y + block) * out.sy).round() as i32).clamp(py0 as i32 + 1, bh) as usize;
-            let (mut rs, mut gs, mut bs, mut n) = (0u64, 0u64, 0u64, 0u64);
-            let mut py = py0;
-            while py < py1 {
-                let row = py * stride;
-                let mut px = px0;
-                while px < px1 {
-                    let i = row + px * 4;
-                    if i + 3 < data.len() {
-                        bs += data[i] as u64;
-                        gs += data[i + 1] as u64;
-                        rs += data[i + 2] as u64;
+    cr.rectangle(r.0, r.1, r.2 - r.0, r.3 - r.1);
+    cr.clip();
+    cr.translate(origin.0, origin.1);
+    cr.scale(MOSAIC_BLOCK, MOSAIC_BLOCK);
+    let _ = cr.set_source(&pat);
+    let _ = cr.paint();
+    let _ = cr.restore();
+}
+
+/// 块平均图的左上角（全局逻辑坐标），对齐到全局的块网格
+///
+/// 网格按全局坐标对齐，跨屏打码时两边的纹路才是接得上的。
+pub fn mosaic_origin(out: &OutputLayer) -> (f64, f64) {
+    (
+        (out.origin.0 / MOSAIC_BLOCK).floor() * MOSAIC_BLOCK,
+        (out.origin.1 / MOSAIC_BLOCK).floor() * MOSAIC_BLOCK,
+    )
+}
+
+/// 取（必要时先算）本屏的块平均图
+///
+/// 每个像素代表 12x12 逻辑像素的平均色，sRGB 直通不进线性空间，贴上去跟原来的
+/// 逐块取平均等价。
+pub fn mosaic_image(out: &mut OutputLayer) -> Option<cairo::ImageSurface> {
+    if out.mosaic.is_none() {
+        out.mosaic = build_mosaic(out);
+    }
+    out.mosaic.clone()
+}
+
+fn build_mosaic(out: &mut OutputLayer) -> Option<cairo::ImageSurface> {
+    let (gx0, gy0) = mosaic_origin(out);
+    let (w, h) = out.size;
+    let cols = ((w + (out.origin.0 - gx0)) / MOSAIC_BLOCK).ceil() as i32;
+    let rows = ((h + (out.origin.1 - gy0)) / MOSAIC_BLOCK).ceil() as i32;
+    if cols <= 0 || rows <= 0 {
+        return None;
+    }
+    let mut img = cairo::ImageSurface::create(cairo::Format::ARgb32, cols, rows).ok()?;
+    let (origin, sx, sy) = (out.origin, out.sx, out.sy);
+    let phys = out.ensure_phys()?;
+    let stride = phys.stride() as usize;
+    let (bw, bh) = (phys.width(), phys.height());
+    {
+        let data = phys.data().ok()?;
+        let dst_stride = img.stride() as usize;
+        let mut dst = img.data().ok()?;
+        for j in 0..rows {
+            for i in 0..cols {
+                // 这一块覆盖的物理像素范围
+                let lx0 = gx0 + f64::from(i) * MOSAIC_BLOCK;
+                let ly0 = gy0 + f64::from(j) * MOSAIC_BLOCK;
+                let px0 = (((lx0 - origin.0) * sx).round().max(0.0) as i32).clamp(0, bw - 1);
+                let py0 = (((ly0 - origin.1) * sy).round().max(0.0) as i32).clamp(0, bh - 1);
+                let px1 = (((lx0 + MOSAIC_BLOCK - origin.0) * sx).round() as i32)
+                    .clamp(px0 + 1, bw) as usize;
+                let py1 = (((ly0 + MOSAIC_BLOCK - origin.1) * sy).round() as i32)
+                    .clamp(py0 + 1, bh) as usize;
+                let (mut rs, mut gs, mut bs, mut n) = (0u64, 0u64, 0u64, 0u64);
+                for py in py0 as usize..py1 {
+                    let row = py * stride;
+                    for px in px0 as usize..px1 {
+                        let k = row + px * 4;
+                        bs += data[k] as u64;
+                        gs += data[k + 1] as u64;
+                        rs += data[k + 2] as u64;
                         n += 1;
                     }
-                    px += step;
                 }
-                py += step;
+                let o = (j as usize) * dst_stride + (i as usize) * 4;
+                if n > 0 {
+                    dst[o] = (bs / n) as u8;
+                    dst[o + 1] = (gs / n) as u8;
+                    dst[o + 2] = (rs / n) as u8;
+                }
+                dst[o + 3] = 255;
             }
-            if n > 0 {
-                cr.set_source_rgb(
-                    rs as f64 / n as f64 / 255.0,
-                    gs as f64 / n as f64 / 255.0,
-                    bs as f64 / n as f64 / 255.0,
-                );
-                cr.rectangle(
-                    x,
-                    y,
-                    (x + block).min(x1) - x,
-                    (y + block).min(y1) - y,
-                );
-                let _ = cr.fill();
-            }
-            x += block;
         }
-        y += block;
     }
-    let _ = cr.restore();
+    img.mark_dirty();
+    Some(img)
 }
 
 #[cfg(test)]
@@ -503,6 +597,7 @@ mod tests {
         phys.mark_dirty();
         Doc::new(
             vec![OutputLayer::new(
+                (0.0, 0.0),
                 (lw as f64, lh as f64),
                 sx,
                 sx,
@@ -514,10 +609,18 @@ mod tests {
     }
 
     fn render(doc: &mut Doc, w: i32, h: i32) -> (Vec<u8>, usize) {
+        render_out(doc, 0, w, h)
+    }
+
+    fn render_out(doc: &mut Doc, idx: usize, w: i32, h: i32) -> (Vec<u8>, usize) {
         let mut target = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).unwrap();
         {
             let cr = cairo::Context::new(&target).unwrap();
-            paint(&cr, doc, 0, (w as f64, h as f64), None);
+            // 下层画面如今由 GtkPicture 合成，这里铺一层同样的浅灰当作它
+            cr.set_source_rgb(200.0 / 255.0, 200.0 / 255.0, 200.0 / 255.0);
+            let _ = cr.paint();
+            let view = doc.outs[idx].origin;
+            paint(&cr, doc, idx, view, None);
             let _ = cr.show_page();
         }
         let mut data = vec![0u8; (w * h * 4) as usize];
@@ -538,60 +641,196 @@ mod tests {
     }
 
     #[test]
-    fn paints_dim_outside_and_keeps_selection_bright() {
-        let mut doc = doc_with(400, 200, 2.0);
-        doc.sel = Some(Selection {
-            out: 0,
-            x0: 100.0,
-            y0: 50.0,
-            x1: 200.0,
-            y1: 100.0,
-        });
-        let (data, w) = render(&mut doc, 400, 200);
-        // 选区内保持原亮度
-        assert!(gray(&data, w, 150, 75) >= 195, "选区内 {}", gray(&data, w, 150, 75));
-        assert!(gray(&data, w, 105, 55) >= 195);
-        // 选区外被压暗（0.45 黑）
-        assert!(gray(&data, w, 10, 10) <= 120, "选区外 {}", gray(&data, w, 10, 10));
-        assert!(gray(&data, w, 380, 180) <= 120);
-        // 选区正下方边界外也要压暗
-        assert!(gray(&data, w, 150, 104) <= 120, "下侧 {}", gray(&data, w, 150, 104));
-        assert!(gray(&data, w, 150, 44) <= 120, "上侧 {}", gray(&data, w, 150, 44));
+    fn hole_rect_is_exact_and_clamped() {
+        let out_rect = (0.0, 0.0, 1000.0, 800.0);
+        // 选区原样，不加余量（外面就是压暗，边界必须严丝合缝）
+        assert_eq!(
+            hole_rect(Some((100.0, 100.0, 300.0, 200.0)), out_rect),
+            Some((100.0, 100.0, 300.0, 200.0))
+        );
+        // 跨屏选区只取本屏那一段
+        assert_eq!(
+            hole_rect(Some((900.0, 100.0, 1400.0, 200.0)), out_rect),
+            Some((900.0, 100.0, 1000.0, 200.0))
+        );
+        // 选区完全在别的屏上
+        assert_eq!(hole_rect(Some((2000.0, 0.0, 2100.0, 100.0)), out_rect), None);
+        // 没有选区也没有悬停窗口
+        assert_eq!(hole_rect(None, out_rect), None);
     }
 
     #[test]
-    fn paints_without_selection() {
-        let mut doc = doc_with(400, 200, 2.0);
-        let (data, w) = render(&mut doc, 400, 200);
-        assert!(gray(&data, w, 0, 0) <= 120);
-        assert!(gray(&data, w, 200, 100) <= 120);
+    fn annot_rect_pads_live_area_and_clamps_to_screen() {
+        let out_rect = (0.0, 0.0, 1000.0, 800.0);
+        let pad = ANNOT_PAD;
+        // 屏幕中间的选区：上面多留一块放尺寸徽标，其余三边只留手柄的量
+        assert_eq!(
+            annot_rect(Some((100.0, 100.0, 300.0, 200.0)), out_rect),
+            Some((100.0 - pad, 100.0 - ANNOT_PAD_TOP, 300.0 + pad, 200.0 + pad))
+        );
+        // 贴边的选区裁在本屏内；上方放不下徽标，所以是下方多留
+        assert_eq!(
+            annot_rect(Some((0.0, 0.0, 300.0, 200.0)), out_rect),
+            Some((0.0, 0.0, 300.0 + pad, 200.0 + ANNOT_PAD_TOP))
+        );
+        // 跨屏选区：本屏只取自己那一段
+        assert_eq!(
+            annot_rect(Some((900.0, 100.0, 1400.0, 200.0)), out_rect),
+            Some((900.0 - pad, 100.0 - ANNOT_PAD_TOP, 1000.0, 200.0 + pad))
+        );
+        // 没有选区也没有悬停窗口，整层可以藏起来
+        assert_eq!(annot_rect(None, out_rect), None);
+        // 选区完全在别的屏上
+        assert_eq!(
+            annot_rect(Some((2000.0, 0.0, 2100.0, 100.0)), out_rect),
+            None
+        );
+        // 全屏选区是退化的最坏情况，仍然是整屏
+        assert_eq!(annot_rect(Some(out_rect), out_rect), Some(out_rect));
     }
 
-    #[test]
-    fn paints_degenerate_selection_without_panic() {
-        let mut doc = doc_with(400, 200, 2.0);
-        for (x0, y0) in [(0.0, 0.0), (399.0, 199.0), (200.0, 100.0)] {
-            doc.sel = Some(Selection {
-                out: 0,
-                x0,
-                y0,
-                x1: x0,
-                y1: y0,
-            });
-            let _ = render(&mut doc, 400, 200);
+    /// 造一块左黑右白的画面：分界在逻辑坐标 split 处
+    fn doc_half(w: i32, h: i32, split: f64) -> Doc {
+        let mut phys = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).unwrap();
+        {
+            let cr = cairo::Context::new(&phys).unwrap();
+            cr.set_source_rgb(0.0, 0.0, 0.0);
+            let _ = cr.paint();
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.rectangle(split, 0.0, f64::from(w) - split, f64::from(h));
+            let _ = cr.fill();
         }
-        // 反向选区（从右下往左上拖）
+        phys.mark_dirty();
+        Doc::new(
+            vec![OutputLayer::new(
+                (0.0, 0.0),
+                (f64::from(w), f64::from(h)),
+                1.0,
+                1.0,
+                phys,
+                Vec::new(),
+            )],
+            "/tmp".into(),
+        )
+    }
+
+    #[test]
+    fn mosaic_paints_block_averages() {
+        // 240 宽的画面，黑白分界在 x=120（正好是第 10 个块）
+        let mut doc = doc_half(240, 120, 120.0);
         doc.sel = Some(Selection {
-            out: 0,
-            x0: 300.0,
-            y0: 150.0,
-            x1: 100.0,
-            y1: 50.0,
+            x0: 0.0,
+            y0: 0.0,
+            x1: 240.0,
+            y1: 120.0,
+        });
+        doc.commit(Stroke {
+            tool: Tool::Mosaic,
+            color: (1.0, 0.0, 0.0),
+            width: 4.0,
+            points: vec![(0.0, 0.0), (240.0, 120.0)],
+            text: None,
+            number: None,
+            text_size: None,
+        });
+        let (data, w) = render_out(&mut doc, 0, 240, 120);
+        // 分界左边整块黑、右边整块白（避开左上角的尺寸徽标与边框手柄）
+        assert!(gray(&data, w, 13, 50) <= 8, "左块 {}", gray(&data, w, 13, 50));
+        assert!(gray(&data, w, 77, 50) <= 8, "左块 {}", gray(&data, w, 77, 50));
+        assert!(gray(&data, w, 200, 50) >= 247, "右块 {}", gray(&data, w, 200, 50));
+        // 同一个块里必须是一整片纯色，不能把原画面的像素露出来
+        assert_eq!(gray(&data, w, 13, 50), gray(&data, w, 23, 58), "同块内应同色");
+        assert_eq!(gray(&data, w, 194, 50), gray(&data, w, 205, 55), "同块内应同色");
+    }
+
+    #[test]
+    fn mosaic_grid_aligns_to_global_coordinates() {
+        // 屏从 x=1000 开始，块网格仍然对齐到全局的 12 的倍数，
+        // 这样跨屏打码时两边的纹路接得上
+        let mut doc = doc_half(240, 120, 120.0);
+        doc.outs[0].origin = (1000.0, 0.0);
+        let (gx0, gy0) = mosaic_origin(&doc.outs[0]);
+        assert_eq!(gx0 % 12.0, 0.0);
+        assert_eq!(gy0, 0.0);
+        assert_eq!(gx0, 996.0, "1000 向上取整到 12 的倍数");
+    }
+
+    #[test]
+    fn number_does_not_leave_a_line_to_the_next_shape() {
+        // 序号画完会在路径里留下当前点（move_to 过字形），而 save/restore 不管
+        // 路径；下一笔椭圆用 arc 画时 cairo 会把弧线起点接到那个点上，表现就是
+        // 从序号到椭圆多出一条线。所以：画不画序号，除了序号自己那一小块，
+        // 别的地方必须一模一样。
+        let number = Stroke {
+            tool: Tool::Number,
+            color: (1.0, 0.0, 0.0),
+            width: 4.0,
+            points: vec![(60.0, 60.0)],
+            text: None,
+            number: Some(1),
+            text_size: None,
+        };
+        let ellipse = Stroke {
+            tool: Tool::Ellipse,
+            color: (1.0, 0.0, 0.0),
+            width: 4.0,
+            points: vec![(250.0, 120.0), (350.0, 180.0)],
+            text: None,
+            number: None,
+            text_size: None,
+        };
+        let draw = |strokes: &[Stroke]| {
+            let mut doc = doc_with(400, 200, 2.0);
+            doc.sel = Some(Selection {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 400.0,
+                y1: 200.0,
+            });
+            for s in strokes {
+                doc.commit(s.clone());
+            }
+            render(&mut doc, 400, 200).0
+        };
+        let only_ellipse = draw(&[ellipse.clone()]);
+        let with_number = draw(&[number, ellipse]);
+        for y in 0..200usize {
+            for x in 0..400usize {
+                let i = (y * 400 + x) * 4;
+                if only_ellipse[i..i + 3] == with_number[i..i + 3] {
+                    continue;
+                }
+                // 序号本身（半径 10 出头）以外不该有变化
+                let far = (x as f64 - 60.0).abs() > 22.0 || (y as f64 - 60.0).abs() > 22.0;
+                assert!(!far, "({x},{y}) 多了东西：序号和椭圆之间被连了一条线");
+            }
+        }
+    }
+
+    #[test]
+    fn draws_annotation_inside_selection() {
+        let mut doc = doc_with(400, 200, 2.0);
+        doc.sel = Some(Selection {
+            x0: 50.0,
+            y0: 40.0,
+            x1: 250.0,
+            y1: 160.0,
+        });
+        doc.commit(Stroke {
+            tool: Tool::Rect,
+            color: (1.0, 0.0, 0.0),
+            width: 3.0,
+            points: vec![(80.0, 60.0), (200.0, 140.0)],
+            text: None,
+            number: None,
+            text_size: None,
         });
         let (data, w) = render(&mut doc, 400, 200);
-        assert!(gray(&data, w, 200, 100) >= 195, "反向选区内部 {}", gray(&data, w, 200, 100));
+        // 矩形上边中点的像素（通道顺序 BGRA）应当是红的
+        let i = (60 * w + 140) * 4;
+        let px = &data[i..i + 3];
+        assert!(px[2] > 150 && px[0] < 120, "标注没画上 {px:?}");
+        // 标注层是透明的，选区外保留底色（压暗由 CSS 那层负责）
+        assert!(gray(&data, w, 10, 10) >= 195);
     }
 }
-
-
-

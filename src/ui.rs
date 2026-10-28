@@ -77,7 +77,15 @@ pub struct Ui {
 }
 
 impl Ui {
-    pub fn build(doc: &Shared, area: &gtk::DrawingArea, actions: &Actions) -> Self {
+    /// area: 铺满整屏的画面层，用来量屏幕尺寸
+    /// draw: 标注层，改动后重绘它
+    pub fn build(
+        doc: &Shared,
+        area: &gtk::Picture,
+        draw: &gtk::DrawingArea,
+        actions: &Actions,
+    ) -> Self {
+        let draw = draw.clone();
         let root = gtk::Box::new(gtk::Orientation::Vertical, 2);
         root.add_css_class("fs-bar");
         root.set_halign(gtk::Align::Start);
@@ -95,11 +103,11 @@ impl Ui {
         entry.set_width_chars(2);
         style_entry(&entry, DEFAULT_COLOR, 4.0);
         {
-            let area = area.clone();
+            let draw = draw.clone();
             let e = entry.clone();
             entry.connect_changed(move |_| {
                 fit_entry(&e);
-                area.queue_draw();
+                draw.queue_draw();
             });
         }
 
@@ -254,14 +262,14 @@ impl Ui {
             group = Some(btn.clone());
             {
                 let doc = doc.clone();
-                let area = area.clone();
+                let draw = draw.clone();
                 btn.connect_toggled(move |b| {
                     if b.is_active() {
                         let mut d = doc.borrow_mut();
                         d.tool = tool;
                         d.text_sel = None;
                         drop(d);
-                        area.queue_draw();
+                        draw.queue_draw();
                     }
                 });
             }
@@ -300,7 +308,7 @@ impl Ui {
         spin.set_can_focus(false);
         {
             let doc = doc.clone();
-            let area = area.clone();
+            let draw = draw.clone();
             let entry = entry.clone();
             spin.connect_value_changed(move |s| {
                 let (color, width) = {
@@ -313,7 +321,7 @@ impl Ui {
                 if entry.get_visible() {
                     entry.grab_focus();
                 }
-                area.queue_draw();
+                draw.queue_draw();
             });
         }
         row_opts.append(&spin);
@@ -326,7 +334,7 @@ impl Ui {
             btn.set_tooltip_text(Some(tip));
             {
                 let doc = doc.clone();
-                let area = area.clone();
+                let draw = draw.clone();
                 let redo = label == "重做";
                 btn.connect_clicked(move |_| {
                     let changed = if redo {
@@ -335,7 +343,7 @@ impl Ui {
                         doc.borrow_mut().undo()
                     };
                     if changed {
-                        area.queue_draw();
+                        draw.queue_draw();
                     }
                 });
             }
@@ -540,6 +548,10 @@ fn place_palette(palette: &gtk::Box, root: &gtk::Box, area: (f64, f64)) {
 /// 重新加载样式表（强调色跟随系统主题色）
 /// 样式表；强调色占位符在加载时替换
 const CSS: &str = "
+        /* 画面还没抓回来时窗口要透明，别用主题底色盖住桌面 */
+        .fs-pending { background-color: transparent; background-image: none; }
+        /* 选区外压暗：四块实心矩形，由合成器填充 */
+        .fs-dim { background-color: rgba(0, 0, 0, DIM_ALPHA); }
         @define-color fs_accent ACCENT;
         .fs-bar {
             background-color: rgba(24, 19, 16, 0.94);
@@ -631,7 +643,9 @@ thread_local! {
 
 /// 按强调色重新加载样式表
 pub fn set_accent(accent: (f64, f64, f64)) {
-    let css = CSS.replace("ACCENT", &crate::theme::rgb_hex(accent));
+    let css = CSS
+        .replace("ACCENT", &crate::theme::rgb_hex(accent))
+        .replace("DIM_ALPHA", &format!("{}", crate::paint::DIM));
     PROVIDER.with(|cell| {
         let provider = cell.get_or_init(|| {
             let p = gtk::CssProvider::new();
@@ -644,7 +658,7 @@ pub fn set_accent(accent: (f64, f64, f64)) {
             }
             p
         });
-        provider.load_from_data(&css);
+        provider.load_from_string(&css);
     });
 }
 

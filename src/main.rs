@@ -1,7 +1,9 @@
 // 命令行入口
 mod capture;
+mod dmabuf;
 mod doc;
 mod export;
+mod hole;
 mod icons;
 mod overlay;
 mod paint;
@@ -24,7 +26,7 @@ fn help() {
          FocusSnapS --version | --help\n\n\
          浮层快捷键:\n  \
          单击窗口        选中整块窗口（悬停时有高亮预览）\n  \
-         拖动            自由框选区域\n  \
+         拖动            自由框选区域（可以跨多块屏）\n  \
          回车 / 空格 / 双击           复制到剪贴板（默认完成动作）\n  \
          Ctrl+S / Ctrl+C             保存文件 / 复制    Esc 退出\n  \
          拖动工具条左侧 ⠿  移动工具条\n  \
@@ -77,7 +79,29 @@ fn check_known(args: &[String], with_value: &[&str], flags: &[&str]) -> Option<S
     None
 }
 
+/// 把 panic 也记到文件里
+///
+/// 浮层一般是热键拉起来的，stderr 没人看。要是有谁在信号回调里 panic 了，
+/// 表现就是「窗口突然没了，什么都没发生」，但现场全丢了。留个文件好查。
+fn log_panics() {
+    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let path = format!("{dir}/focus-snaps.log");
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        let msg = format!("[panic] {info}\n");
+        eprint!("{msg}");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = f.write_all(msg.as_bytes());
+        }
+    }));
+}
+
 fn main() {
+    log_panics();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let code = match argv.first().map(|s| s.as_str()) {
         Some("grab") => cmd_grab(&argv[1..]),
@@ -139,8 +163,17 @@ fn cmd_grab(argv: &[String]) -> i32 {
             return 1;
         }
     };
+    // 零拷贝那条路画面在显存里，这里读一份像素出来（CLI 要的就是像素）
+    let (width, height) = (cap.width, cap.height);
+    let pixels = match cap.into_pixels() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("抓屏失败: {e}");
+            return 1;
+        }
+    };
     if let Some(path) = args.value(&["--png"]) {
-        let mut surface = match export::surface_from_bgra(cap.width, cap.height, &cap.pixels) {
+        let mut surface = match export::surface_from_bgra(width, height, &pixels) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("{e}");
@@ -149,7 +182,7 @@ fn cmd_grab(argv: &[String]) -> i32 {
         };
         return match export::save_to_path(&mut surface, &path) {
             Ok(p) => {
-                println!("{}x{} {}", cap.width, cap.height, p.display());
+                println!("{width}x{height} {}", p.display());
                 0
             }
             Err(e) => {
@@ -159,9 +192,9 @@ fn cmd_grab(argv: &[String]) -> i32 {
         };
     }
     let mut stdout = std::io::stdout().lock();
-    if stdout.write_all(&cap.width.to_le_bytes()).is_err()
-        || stdout.write_all(&cap.height.to_le_bytes()).is_err()
-        || stdout.write_all(&cap.pixels).is_err()
+    if stdout.write_all(&width.to_le_bytes()).is_err()
+        || stdout.write_all(&height.to_le_bytes()).is_err()
+        || stdout.write_all(&pixels).is_err()
     {
         eprintln!("写 stdout 失败");
         return 1;
@@ -207,7 +240,15 @@ fn cmd_full(argv: &[String]) -> i32 {
             return 1;
         }
     };
-    let mut surface = match export::surface_from_bgra(cap.width, cap.height, &cap.pixels) {
+    let (width, height) = (cap.width, cap.height);
+    let pixels = match cap.into_pixels() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("抓屏失败: {e}");
+            return 1;
+        }
+    };
+    let mut surface = match export::surface_from_bgra(width, height, &pixels) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{e}");
@@ -291,7 +332,15 @@ fn cmd_detect(argv: &[String]) -> i32 {
                 return 1;
             }
         };
-        match export::surface_from_bgra(cap.width, cap.height, &cap.pixels) {
+        let (width, height) = (cap.width, cap.height);
+        let pixels = match cap.into_pixels() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("抓屏失败: {e}");
+                return 1;
+            }
+        };
+        match export::surface_from_bgra(width, height, &pixels) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("{e}");

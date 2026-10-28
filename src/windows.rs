@@ -141,12 +141,23 @@ fn solve_offset(
     let (score, max_score) = {
         let data = surface.data().ok()?;
         let mut score = vec![0f32; w];
-        for (x, slot) in score.iter_mut().enumerate().take(w - 1) {
-            let mut acc = 0f32;
-            for y in 0..h {
-                acc += (lum(&data, stride, x, y) - lum(&data, stride, x + 1, y)).abs();
+        // 每列得分是「整列上相邻像素亮度差的绝对值和」，按行累加结果完全一样，
+        // 但内存变成顺序读：按列扫的时候每个像素都要跨一个 stride 去取，
+        // 5120x2160 的画面上全是 cache miss，这一段能占掉上百毫秒。
+        // 行再隔一个取一个——窗口竖边贯穿上千行，跳着取不影响判断。
+        let step = if h > 256 { 2 } else { 1 };
+        let mut y = 0;
+        while y < h {
+            let row = &data[y * stride..(y * stride + w * 4).min(data.len())];
+            let mut prev = 0f32;
+            for (i, px) in row.chunks_exact(4).enumerate() {
+                let cur = luma(px);
+                if i > 0 {
+                    score[i - 1] += (prev - cur).abs();
+                }
+                prev = cur;
             }
-            *slot = acc;
+            y += step;
         }
         let mx = score.iter().cloned().fold(0f32, f32::max);
         (score, mx)
@@ -491,6 +502,12 @@ fn horizontal_bounds(
     }
     let (a, b, _) = best?;
     Some(((a + 1) as f64 / sy, b as f64 / sy))
+}
+
+/// 一个像素的亮度（BGRA 内存序）
+#[inline]
+fn luma(px: &[u8]) -> f32 {
+    0.114 * px[0] as f32 + 0.587 * px[1] as f32 + 0.299 * px[2] as f32
 }
 
 #[inline]

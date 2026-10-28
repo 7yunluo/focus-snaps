@@ -8,14 +8,20 @@ name = "FocusSnapS"
 path = "src/main.rs"
 
 [dependencies]
-gtk = { package = "gtk4", version = "0.11" }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_8", "v4_14"] }
 gtk4-layer-shell = "0.8"
 pangocairo = "0.22"
 wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rustix = { version = "1", features = ["fs", "mm"] }
 serde_json = "1"
 
 [profile.release]
-opt-level = 2
+# 剩下的纯 CPU 热点都在逐像素循环里（PNG 编码、块平均、通道转换），
+# 放开内联和跨 crate 优化让它们能向量化
+opt-level = 3
+lto = "thin"
+codegen-units = 1
