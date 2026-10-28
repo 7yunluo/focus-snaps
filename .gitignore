@@ -4,3 +4,4 @@
 /packaging/*.tar.gz
 /packaging/*.pkg.tar.zst
 CLAUDE.md
+AGENTS_QA.md
