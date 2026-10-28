@@ -1660,15 +1660,24 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
     // 差一个逻辑像素会让整块浮层被缩放一次（DP-1：GDK 3793 → 缓冲 5121，
     // 而输出是 5120）。对不上就自己定尺寸，只锚左上。
     let gdk_geo = monitor.geometry();
+    // 逻辑尺寸取「合成器报的」和「GDK 算的」里大的那个。
+    //
+    // 合成器报的数是舍过的：DP-1 上 5120 / 1.35 = 3792.59 报成 3792，按 3792
+    // 建表面，缓冲只有 round(3792×1.35) = 5119 个物理像素，比屏少 1——最右边
+    // 那一列既没有画面（露出没压暗的桌面），鼠标点下去还会漏给下面的窗口。
+    // GDK 算的是 3793，缓冲 5121，多出来那点在屏幕外，合成器自己裁掉。
+    // 宁可多盖一点，也不能留缝。
     let own_size = {
         let s = sess.borrow();
         let doc = s.doc.borrow();
-        doc.outs.get(idx).map(|o| {
-            (
-                o.size.0.round() as i32,
-                o.size.1.round() as i32,
-            )
-        })
+        doc.outs
+            .get(idx)
+            .map(|o| {
+                (
+                    (o.size.0.round() as i32).max(gdk_geo.width()),
+                    (o.size.1.round() as i32).max(gdk_geo.height()),
+                )
+            })
     }
     .filter(|(w, h)| *w > 0 && *h > 0 && (*w != gdk_geo.width() || *h != gdk_geo.height()));
     if let Some((w, h)) = own_size {
