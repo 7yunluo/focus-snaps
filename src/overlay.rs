@@ -42,6 +42,8 @@ struct DragState {
     /// 拖动文字时的原始落点
     text_from: (f64, f64),
     moved: bool,
+    /// 这次松手已经处理过了（两个手势都会走到 on_drag_end）
+    ended: bool,
 }
 
 impl Default for DragState {
@@ -54,6 +56,7 @@ impl Default for DragState {
             saved_number: 1,
             text_from: (0.0, 0.0),
             moved: false,
+            ended: false,
         }
     }
 }
@@ -2151,6 +2154,7 @@ fn on_drag_begin(s: &mut Session, idx: usize, x: f64, y: f64) {
         saved_number: s.doc.borrow().next_number,
         text_from: (0.0, 0.0),
         moved: false,
+        ended: false,
     };
 
     let cur = sel.map(|s| s.normalized());
@@ -2344,13 +2348,16 @@ fn on_drag_update(s: &mut Session, _idx: usize, x: f64, y: f64) {
 }
 
 fn on_drag_end(s: &mut Session, idx: usize, x: f64, y: f64) {
-    // 「拖拽结束」和「左键抬起兜底」两个手势都会走到这儿，一次物理松手可能进来
-    // 两次。第二次进来时拖拽状态已经清掉了，要是还往下走，就会把这次松手当成
-    // 又点了一下——于是单击被凑成「双击」，直接就把截图确认掉了
-    if s.drag.kind == DragKind::None {
-        trace("松手：拖拽已经结束过了，忽略");
+    // 「拖拽结束」和「左键抬起兜底」两个手势都会走到这儿，一次物理松手会进来
+    // 两次。第二次要是还往下走，就会把这次松手当成又点了一下——单击被凑成
+    // 「双击」直接把截图确认掉，文字/序号还会被放两份。
+    // 注意不能拿「拖拽种类是不是 None」当判据：文字和序号本来就不进拖动，
+    // 它们的落点正是靠这里走到 on_click 放下去的。
+    if s.drag.ended {
+        trace("松手：这次按下已经处理过了，忽略");
         return;
     }
+    s.drag.ended = true;
     trace("松手");
     let kind = s.drag.kind;
     s.drag.kind = DragKind::None;
