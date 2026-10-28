@@ -148,6 +148,10 @@ pub fn render_selection(doc: &mut Doc) -> Result<cairo::ImageSurface, String> {
     {
         let cr = cairo::Context::new(&surface).map_err(|e| format!("建立绘图上下文失败: {e}"))?;
 
+        // 没有屏覆盖的地方（布局错开时的空隙）铺不透明的黑，别留透明像素
+        cr.set_source_rgb(0.0, 0.0, 0.0);
+        let _ = cr.paint();
+
         // 底图：每块屏把自己那一段贴到画布上对应的位置
         for (i, r) in &hits {
             let o = &mut outs[*i];
