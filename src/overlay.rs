@@ -2,6 +2,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use gtk::cairo;
 use gtk::gdk;
 use gtk::gio;
 use gtk::glib;
@@ -79,6 +80,8 @@ struct Win {
     rect: Rect4,
     /// 当前光标名（避免重复设置，设一次要查光标主题）
     cursor: std::cell::Cell<&'static str>,
+    /// 指针移动控制器：拖动期间关掉，松手后要重新打开
+    motion: gtk::EventControllerMotion,
 }
 
 struct Session {
@@ -112,6 +115,10 @@ struct Session {
     pointer_at: Option<(usize, f64, f64)>,
     /// 正在后台读像素的屏（别重复读）
     pixels_reading: Vec<usize>,
+    /// 读像素失败过的屏（屏下标 + 连续失败次数），连败几次就不再试
+    pixels_failed: Vec<(usize, u32)>,
+    /// 隐藏窗口那一代的编号，改一下就把还没执行的那次隐藏撤掉
+    hide_gen: Rc<std::cell::Cell<u32>>,
     /// 收窗口之后的超时保险已经上过了
     export_timeout_armed: bool,
 }
@@ -469,6 +476,8 @@ fn build(app: &gtk::Application, opts: &Options) -> Result<(), String> {
         pointer_queued: false,
         pointer_at: None,
         pixels_reading: Vec::new(),
+        pixels_failed: Vec::new(),
+        hide_gen: Rc::new(std::cell::Cell::new(0)),
         export_timeout_armed: false,
     }));
 
@@ -933,14 +942,19 @@ fn apply_capture(
                 (t, Some(buf), None)
             }
             Err(e) => {
-                // 导不进纹理就退回普通纹理（慢，但总比没画面强）
+                // 导不进纹理就退回像素上传；零拷贝那一路的像素从显存里读
                 eprintln!("{connector} 零拷贝纹理失败（{e}），改用像素上传");
-                let pixels = std::mem::take(&mut cap.pixels);
+                let pixels = if cap.pixels.is_empty() {
+                    buf.reader().read_pixels().unwrap_or_default()
+                } else {
+                    std::mem::take(&mut cap.pixels)
+                };
                 if pixels.is_empty() {
+                    eprintln!("{connector} 显存里的像素也读不出来，这块屏这次没有画面");
                     return;
                 }
                 let t = export::texture_from_bgra(&pixels, width, height);
-                (t, None, Some(pixels))
+                (t, Some(buf), Some(pixels))
             }
         },
         None => {
@@ -991,13 +1005,13 @@ fn apply_capture(
     // 用户开始拖框，拖动会卡一下、甚至整个按下-拖动被吞掉。
     let args = DetectArgs { sx, sy, origin, size };
     match (reader, pixels) {
-        // 零拷贝：后台线程从显存里读，读完顺手识别
-        (Some(reader), _) => {
-            spawn_pixels(sess, idx, connector.to_string(), args, Some(reader), None)
-        }
-        // 共享内存：像素在手上，直接丢给后台线程识别，识完就扔
-        (None, Some(px)) => {
+        // 像素已经在手上（纹理导入失败退回的那条路），直接用，别再读一遍显存
+        (_, Some(px)) => {
             spawn_pixels(sess, idx, connector.to_string(), args, None, Some((px, width, height)))
+        }
+        // 零拷贝：后台线程从显存里读，读完顺手识别
+        (Some(reader), None) => {
+            spawn_pixels(sess, idx, connector.to_string(), args, Some(reader), None)
         }
         (None, None) => {}
     }
@@ -1066,11 +1080,7 @@ fn spawn_pixels(
     });
 }
 
-/// 需要像素的时候才去取：导出、打码
-///
-/// 只在两种时刻需要——用户按了复制/保存（pending），或者切到打码工具。
-/// 取法优先「后台线程从显存缓冲 mmap 读」：GPU 回读（TextureDownloader）得在
-/// 主线程做，这台机器负载高的时候实测一次能卡 3 秒，比等后台那一秒糟得多。
+/// 需要像素的时候才去取：导出、打码，以及选区定下来之后提前备一份
 fn start_pixel_broker(sess: &SessionRef) {
     let sess2 = sess.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
@@ -1079,13 +1089,15 @@ fn start_pixel_broker(sess: &SessionRef) {
                 return glib::ControlFlow::Continue;
             };
             let d = s.doc.borrow();
-            let want = s.pending.is_some() || d.tool == Tool::Mosaic;
+            // 拖动过程中不要读：那正是要用 CPU 的时候
+            let sel_settled = d.sel.is_some() && s.drag.kind == DragKind::None;
+            let want = s.pending.is_some() || d.tool == Tool::Mosaic || sel_settled;
             let todo: Vec<usize> = match want {
                 false => Vec::new(),
                 true => s
                     .wanted_outputs(&d)
                     .into_iter()
-                    .filter(|i| d.outs[*i].phys.is_none() && !s.pixels_reading.contains(i))
+                    .filter(|i| d.outs[*i].phys.is_none() && s.may_fetch(*i))
                     .collect(),
             };
             (want, todo)
@@ -1120,14 +1132,19 @@ fn fetch_pixels(sess: &SessionRef, idx: usize) {
     trace(&format!("取像素：屏 {idx} 走{}", if reader.is_some() { "显存缓冲" } else { "纹理下载" }));
     let Some(reader) = reader else {
         // 共享内存那条路没有可读的缓冲，只能下载（数据本来就在内存里，是拷贝）
-        if let Some(texture) = texture {
-            match export::pixels_from_texture(&texture) {
-                Ok((pixels, w, h)) => store_pixels(sess, idx, pixels, w, h),
-                Err(e) => eprintln!("从纹理取像素失败: {e}"),
+        let Some(texture) = texture else {
+            pixel_fetch_failed(sess, idx);
+            return;
+        };
+        let mut slot = match export::pixels_from_texture(&texture) {
+            Ok((pixels, w, h)) => Some((pixels, w, h)),
+            Err(e) => {
+                eprintln!("从纹理取像素失败: {e}");
+                None
             }
-        }
-        if let Ok(mut s) = sess.try_borrow_mut() {
-            s.pixels_reading.retain(|i| *i != idx);
+        };
+        if slot.is_none() || !store_pixels(sess, idx, &mut slot) {
+            pixel_fetch_failed(sess, idx);
         }
         return;
     };
@@ -1145,27 +1162,61 @@ fn fetch_pixels(sess: &SessionRef, idx: usize) {
         }
     });
     let sess2 = sess.clone();
+    let mut slot: Option<(Vec<u8>, i32, i32)> = None;
     glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
-        match rx.try_recv() {
-            Ok(Some((pixels, w, h))) => {
-                store_pixels(&sess2, idx, pixels, w, h);
-                glib::ControlFlow::Break
+        if slot.is_none() {
+            match rx.try_recv() {
+                Ok(Some(v)) => slot = Some(v),
+                // 读失败：清掉「正在取」并记一次失败
+                Ok(None) => {
+                    pixel_fetch_failed(&sess2, idx);
+                    return glib::ControlFlow::Break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    return glib::ControlFlow::Continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    pixel_fetch_failed(&sess2, idx);
+                    return glib::ControlFlow::Break;
+                }
             }
-            Ok(None) => glib::ControlFlow::Break,
-            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        }
+        if store_pixels(&sess2, idx, &mut slot) {
+            glib::ControlFlow::Break
+        } else {
+            // 会话正被借用，像素先攥在手里，下一轮再放
+            glib::ControlFlow::Continue
         }
     });
 }
 
-/// 像素到手：建画布（零拷贝接管这块内存），然后看看有没有等在后面的导出
-fn store_pixels(sess: &SessionRef, idx: usize, pixels: Vec<u8>, w: i32, h: i32) {
-    let surface = crate::export::surface_from_bgra_owned(pixels, w as u32, h as u32);
+/// 这次取像素黄了：清掉「正在取」标记，并记一次失败
+fn pixel_fetch_failed(sess: &SessionRef, idx: usize) {
     let Ok(mut s) = sess.try_borrow_mut() else {
-        trace("像素到手了，但会话正被借用，丢了");
+        // 会话正被借用，一会儿再来清
+        let sess2 = sess.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(20), move || {
+            pixel_fetch_failed(&sess2, idx)
+        });
         return;
     };
     s.pixels_reading.retain(|i| *i != idx);
+    s.note_pixel_failure(idx);
+}
+
+/// 像素到手：建画布（零拷贝接管这块内存），然后看看有没有等在后面的导出
+///
+/// 取走 `slot` 里的像素；返回 false 表示会话正被借用、没放进去，调用方下一轮再试
+fn store_pixels(sess: &SessionRef, idx: usize, slot: &mut Option<(Vec<u8>, i32, i32)>) -> bool {
+    let Ok(mut s) = sess.try_borrow_mut() else {
+        return false;
+    };
+    let Some((pixels, w, h)) = slot.take() else {
+        return false;
+    };
+    let surface = crate::export::surface_from_bgra_owned(pixels, w as u32, h as u32);
+    s.pixels_reading.retain(|i| *i != idx);
+    s.pixels_failed.retain(|(i, _)| *i != idx);
     match surface {
         Ok(surface) => {
             if let Some(o) = s.doc.borrow_mut().outs.get_mut(idx) {
@@ -1178,6 +1229,7 @@ fn store_pixels(sess: &SessionRef, idx: usize, pixels: Vec<u8>, w: i32, h: i32) 
     log_export(&format!("像素到手：屏 {idx}"));
     s.redraw();
     s.flush_pending();
+    true
 }
 
 /// 在后台线程里扫一遍像素认窗口，结果换成全局坐标
@@ -1231,6 +1283,38 @@ impl Session {
             self.pending_drag = Some((idx, gx, gy));
         } else {
             self.pending_hover = Some((gx, gy));
+        }
+    }
+
+    /// 这块屏现在能不能去取像素（没在取、也没连败太多次）
+    fn may_fetch(&self, i: usize) -> bool {
+        if self.pixels_reading.contains(&i) {
+            return false;
+        }
+        self.pixels_failed
+            .iter()
+            .find(|(j, _)| *j == i)
+            .map(|(_, n)| *n < 3)
+            .unwrap_or(true)
+    }
+
+    /// 记一次读像素失败，连败三次就放弃这次导出
+    fn note_pixel_failure(&mut self, idx: usize) {
+        let n = match self.pixels_failed.iter_mut().find(|(i, _)| *i == idx) {
+            Some((_, n)) => {
+                *n += 1;
+                *n
+            }
+            None => {
+                self.pixels_failed.push((idx, 1));
+                1
+            }
+        };
+        if n >= 3 {
+            eprintln!("屏 {idx} 的像素读不出来，放弃这次导出");
+            if self.pending.take().is_some() {
+                self.show_windows();
+            }
         }
     }
 
@@ -1565,7 +1649,7 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
         if std::env::var("FOCUSSNAPS_TEST_POINTER").is_ok() {
             motion.connect_motion(|_, x, y| eprintln!("POS {x:.1} {y:.1}"));
         }
-        picture.add_controller(motion);
+        picture.add_controller(motion.clone());
     }
 
     // 右键：清掉选区 / 退出
@@ -1710,6 +1794,7 @@ fn make_window(app: &gtk::Application, sess: &SessionRef, idx: usize, monitor: &
         origin,
         rect,
         cursor: std::cell::Cell::new("crosshair"),
+        motion,
     }
 }
 
@@ -2011,9 +2096,11 @@ impl Session {
         }
     }
 
-    /// 量一段文字的排版尺寸，用该屏的画面建上下文
-    fn measure_text(&self, out: usize, text: &str, px: f64) -> Option<(f64, f64)> {
-        let surface = self.doc.borrow().outs.get(out).and_then(|o| o.phys.clone())?;
+    /// 量一段文字的排版尺寸，用一个临时画布建上下文
+    ///
+    /// 不依赖本屏画面（那块像素是按需取的）
+    fn measure_text(&self, _out: usize, text: &str, px: f64) -> Option<(f64, f64)> {
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1).ok()?;
         crate::paint::text_size(&surface, text, px)
     }
 
@@ -2046,9 +2133,19 @@ impl Session {
         // 我们这次信号回调还没退出去的时候重入 drag_end，而外面的 RefCell
         // 还借着——直接 panic（在 extern "C" 回调里就是 abort，表现成
         // 「窗口消失、什么都没发生」）。丢到下一轮主循环再收。
+        //
+        // 代数：`show_windows` 改一下代数，这些还没执行的隐藏就作废
+        let gen = self.hide_gen.get() + 1;
+        self.hide_gen.set(gen);
+        let hg = self.hide_gen.clone();
         for w in &self.wins {
             let win = w.window.clone();
-            glib::idle_add_local_once(move || win.set_visible(false));
+            let hg = hg.clone();
+            glib::idle_add_local_once(move || {
+                if hg.get() == gen {
+                    win.set_visible(false);
+                }
+            });
         }
         // 窗口收起来之后就没法用界面自救了：万一导出那条路卡死（wl-copy 不返回
         // 之类），这里兜一下，别留一个「看不见但还活着」的进程攥着键盘
@@ -2067,6 +2164,8 @@ impl Session {
 
     /// 导出没做成（比如取像素失败）就把浮层还回去，别留个看不见的窗口
     fn show_windows(&self) {
+        // 作废还没执行的那次隐藏（见 hide_windows 里的代数）
+        self.hide_gen.set(self.hide_gen.get() + 1);
         for w in &self.wins {
             if !w.window.is_visible() {
                 w.window.set_visible(true);
@@ -2514,6 +2613,13 @@ fn on_drag_update(s: &mut Session, _idx: usize, x: f64, y: f64) {
 }
 
 fn on_drag_end(s: &mut Session, idx: usize, x: f64, y: f64) {
+    // 拖动期间 motion 控制器是关着的，这里统一打开；松手可能落在别的屏上，
+    // 那块屏的 drag_end 不会跑
+    for w in &s.wins {
+        if w.motion.propagation_phase() != gtk::PropagationPhase::Bubble {
+            w.motion.set_propagation_phase(gtk::PropagationPhase::Bubble);
+        }
+    }
     // 「拖拽结束」和「左键抬起兜底」两个手势都会走到这儿，一次物理松手会进来
     // 两次。第二次要是还往下走，就会把这次松手当成又点了一下——单击被凑成
     // 「双击」直接把截图确认掉，文字/序号还会被放两份。
@@ -2526,6 +2632,10 @@ fn on_drag_end(s: &mut Session, idx: usize, x: f64, y: f64) {
     s.drag.ended = true;
     trace("松手");
     let kind = s.drag.kind;
+    // 松手位置也要落地：拖动中的几何是按帧合并着改的，最后一个位置可能还没处理
+    if !matches!(kind, DragKind::None) {
+        on_drag_update(s, idx, x, y);
+    }
     s.drag.kind = DragKind::None;
 
     match kind {
