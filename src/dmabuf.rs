@@ -17,6 +17,29 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::{
 /// 线性排布，dumb buffer 一定是它
 const LINEAR: u64 = 0;
 
+/// DRM fourcc 的名字换成数值
+const fn fourcc_tag(tag: [u8; 4]) -> u32 {
+    (tag[0] as u32) | ((tag[1] as u32) << 8) | ((tag[2] as u32) << 16) | ((tag[3] as u32) << 24)
+}
+
+/// 下游要的是 B,G,R,A 字节序；小端机器上这两个名字就是它，大端上要换另外两个
+const BGRA_FOURCCS: [u32; 2] = if cfg!(target_endian = "little") {
+    [
+        fourcc_tag([b'A', b'R', b'2', b'4']),
+        fourcc_tag([b'X', b'R', b'2', b'4']),
+    ]
+} else {
+    [
+        fourcc_tag([b'B', b'A', b'2', b'4']),
+        fourcc_tag([b'B', b'X', b'2', b'4']),
+    ]
+};
+
+/// 这个格式的内存字节序是不是下游要的 BGRA
+pub fn is_bgra_fourcc(format: u32) -> bool {
+    BGRA_FOURCCS.contains(&format)
+}
+
 /// ioctl 请求号：`_IOWR('d', nr, type)`
 const fn request(number: u64, size: u64) -> std::ffi::c_ulong {
     const WRITE: u64 = 1;
@@ -79,8 +102,11 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    /// 在显卡上分配一块线性缓冲，格式用合成器在 `linux_dmabuf` 事件里报的那个
+    /// 在显卡上分配一块线性缓冲，格式只能是下游认的 BGRA 字节序
     pub fn allocate(width: u32, height: u32, format: u32) -> Result<Self, String> {
+        if !is_bgra_fourcc(format) {
+            return Err(format!("不支持的显存格式 0x{format:08x}"));
+        }
         let card = card_node()?;
         let mut create = CreateDumb {
             height,
@@ -123,8 +149,15 @@ impl Buffer {
         })
     }
 
-    /// 包成合成器认的 `wl_buffer`
-    pub fn wrap<S>(&self, dmabuf: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, qh: &QueueHandle<S>) -> wl_buffer::WlBuffer
+    /// 把这块缓冲交给合成器，把等结果的 params 对象交回去
+    ///
+    /// 走异步的 `create`：合不合成等 `created` / `failed` 事件，
+    /// 拿到答案之后由调用方 destroy 这个 params。
+    pub fn import<S>(
+        &self,
+        dmabuf: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+        qh: &QueueHandle<S>,
+    ) -> zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1
     where
         S: Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, ()>
             + Dispatch<wl_buffer::WlBuffer, ()>
@@ -139,17 +172,13 @@ impl Buffer {
             (self.modifier >> 32) as u32,
             (self.modifier & 0xffff_ffff) as u32,
         );
-        // create_immed 是同步那一支：直接拿到 wl_buffer，不用等 created 事件
-        let buffer = params.create_immed(
+        params.create(
             self.width as i32,
             self.height as i32,
             self.format,
             zwp_linux_buffer_params_v1::Flags::empty(),
-            qh,
-            (),
         );
-        params.destroy();
-        buffer
+        params
     }
 
 
@@ -255,4 +284,27 @@ fn card_node() -> Result<OwnedFd, String> {
         }
     }
     Err(format!("没有可用的 DRM card 节点（{}）", tried.join(", ")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_bgra_byte_order() {
+        // 下游认的那两个格式
+        for f in BGRA_FOURCCS {
+            assert!(is_bgra_fourcc(f), "0x{f:08x} 应当被接受");
+        }
+        // ABGR / XBGR 字节序、10 位、64 位都要拒掉
+        for tag in [
+            [b'A', b'B', b'2', b'4'],
+            [b'X', b'B', b'2', b'4'],
+            [b'A', b'B', b'3', b'0'],
+            [b'R', b'A', b'3', b'0'],
+            [b'A', b'R', b'4', b'8'],
+        ] {
+            assert!(!is_bgra_fourcc(fourcc_tag(tag)), "{:?} 应当被拒掉", tag);
+        }
+    }
 }

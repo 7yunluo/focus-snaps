@@ -1,20 +1,30 @@
 // 抓屏：枚举 Wayland 显示器并按合成器旋转归一化，取一帧像素
 use std::io::{Read, Seek, SeekFrom};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::time::{Duration, Instant};
 
 use rustix::fs::{ftruncate, memfd_create, MemfdFlags};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool};
-use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle, WEnum};
+use wayland_client::{
+    delegate_noop, event_created_child, Connection, Dispatch, EventQueue, QueueHandle, WEnum,
+};
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::{
     self as frame, ZwlrScreencopyFrameV1,
 };
-use wayland_protocols::wp::linux_dmabuf::zv1::client::{
-    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::{
+    self as params, ZwpLinuxBufferParamsV1,
 };
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1;
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 
 use crate::dmabuf;
+
+/// 一次抓屏尝试最多等这么久
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// 抓屏整体（含退回共享内存的重试）最多等这么久
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// 一个显示器的 Wayland 侧信息
 #[derive(Clone, Debug)]
@@ -75,10 +85,19 @@ struct OutputSlot {
 struct State {
     shm: Option<wl_shm::WlShm>,
     manager: Option<ZwlrScreencopyManagerV1>,
+    /// 绑定的 screencopy manager 版本
+    manager_version: u32,
     outputs: Vec<OutputSlot>,
     geom: Option<(i32, i32, i32)>,
     fd: Option<OwnedFd>,
-    _buffer: Option<wl_buffer::WlBuffer>,
+    /// 共享内存那条路的 wl_buffer，dmabuf 没谈成时拿它发 copy
+    shm_buffer: Option<wl_buffer::WlBuffer>,
+    /// 零拷贝那条路的 wl_buffer
+    dmabuf_buffer: Option<wl_buffer::WlBuffer>,
+    /// 这一帧的 frame 对象，`created` 里要用它发 copy
+    frame: Option<ZwlrScreencopyFrameV1>,
+    /// 等合成器回答 created / failed 的 params 对象
+    params: Option<ZwpLinuxBufferParamsV1>,
     result: Option<Vec<u8>>,
     failed: Option<String>,
     finished: bool,
@@ -177,7 +196,8 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                 height,
                 stride,
             } => {
-                if state.copied || state.use_dmabuf {
+                // 共享内存这条一直备着：dmabuf 谈不成时要靠它顶上
+                if state.copied || state.shm_buffer.is_some() {
                     return;
                 }
                 let format = match format {
@@ -219,43 +239,56 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                 let pool = shm.create_pool(fd.as_fd(), size as i32, qh, ());
                 let (wi, hi, si) = (width as i32, height as i32, stride as i32);
                 let buffer = pool.create_buffer(0, wi, hi, si, format, qh, ());
-                proxy.copy(&buffer);
-                state.copied = true;
                 state.geom = Some((wi, hi, si));
                 state.fd = Some(fd);
-                state._buffer = Some(buffer);
+                state.shm_buffer = Some(buffer.clone());
+                // 不走零拷贝、或合成器没有 buffer_done 事件，这里就直接发 copy
+                if !state.use_dmabuf {
+                    proxy.copy(&buffer);
+                    state.copied = true;
+                }
             }
             frame::Event::LinuxDmabuf {
                 format,
                 width,
                 height,
             } => {
+                // 只认下游能直接当 BGRA 用的格式，别的（ABGR、10 位、多平面）退回共享内存
+                if !dmabuf::is_bgra_fourcc(format) {
+                    eprintln!("显存格式 0x{format:08x} 不是 BGRA 字节序，不用零拷贝");
+                    return;
+                }
                 state.dmabuf_offer = Some((format, width, height));
             }
             frame::Event::BufferDone => {
-                if state.copied || !state.use_dmabuf {
+                if state.copied {
                     return;
                 }
-                let (Some(dmabuf), Some((format, w, h))) =
-                    (state.dmabuf.clone(), state.dmabuf_offer)
-                else {
+                if state.use_dmabuf {
+                    if let (Some(dmabuf), Some((format, w, h))) =
+                        (state.dmabuf.clone(), state.dmabuf_offer)
+                    {
+                        match dmabuf::Buffer::allocate(w, h, format) {
+                            Ok(buf) => {
+                                // copy 等 created 事件到了再发
+                                state.params = Some(buf.import(&dmabuf, qh));
+                                state.dmabuf_buf = Some(buf);
+                                return;
+                            }
+                            Err(e) => {
+                                eprintln!("零拷贝抓屏不可用（{e}），退回共享内存");
+                            }
+                        }
+                    }
+                }
+                // 退回共享内存：buffer 事件里已经备好了
+                let Some(buffer) = state.shm_buffer.clone() else {
+                    state.failed = Some("合成器没有给出可用的画面格式".into());
+                    state.finished = true;
                     return;
                 };
-                match dmabuf::Buffer::allocate(w, h, format) {
-                    Ok(buf) => {
-                        let wl = buf.wrap(&dmabuf, qh);
-                        proxy.copy(&wl);
-                        state.copied = true;
-                        state.dmabuf_buf = Some(buf);
-                        state._buffer = Some(wl);
-                    }
-                    Err(e) => {
-                        // 分配不出来就退回共享内存那条路（frame 已经用掉，下次再说）
-                        eprintln!("零拷贝抓屏不可用（{e}），退回共享内存");
-                        state.failed = Some(e);
-                        state.finished = true;
-                    }
-                }
+                proxy.copy(&buffer);
+                state.copied = true;
             }
             frame::Event::Ready { .. } => {
                 state.finished = true;
@@ -319,11 +352,52 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
     }
 }
 
+/// 合成器对显存缓冲的答复：`created` 才能发 copy，`failed` 就退回共享内存
+impl Dispatch<ZwpLinuxBufferParamsV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &ZwpLinuxBufferParamsV1,
+        event: params::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            params::Event::Created { buffer } => match state.frame.clone() {
+                Some(frame) => {
+                    state.dmabuf_buffer = Some(buffer.clone());
+                    frame.copy(&buffer);
+                    state.copied = true;
+                }
+                None => {
+                    state.failed = Some("零拷贝缺少 screencopy frame".into());
+                    state.finished = true;
+                }
+            },
+            params::Event::Failed => {
+                eprintln!("合成器不接受这块显存缓冲，退回共享内存");
+                state.dmabuf_buf = None;
+                state.failed = Some("合成器不接受显存缓冲".into());
+                state.finished = true;
+            }
+            _ => {}
+        }
+        // 答复到了才销毁 params
+        if let Some(params) = state.params.take() {
+            params.destroy();
+        }
+    }
+
+    // `created` 事件里带回来的 wl_buffer
+    event_created_child!(State, ZwpLinuxBufferParamsV1, [
+        params::EVT_CREATED_OPCODE => (wl_buffer::WlBuffer, ()),
+    ]);
+}
+
 delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore ZwlrScreencopyManagerV1);
 delegate_noop!(State: ignore zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1);
-delegate_noop!(State: ignore zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1);
 
 /// 打开一个 Wayland 连接并绑定需要的全局对象
 fn connect() -> Result<(Connection, State, wayland_client::EventQueue<State>), String> {
@@ -348,6 +422,7 @@ fn connect() -> Result<(Connection, State, wayland_client::EventQueue<State>), S
             }
             "zwlr_screencopy_manager_v1" => {
                 let v = g.version.min(3);
+                state.manager_version = v;
                 state.manager = Some(globals.registry().bind(g.name, v, &qh, ()));
             }
             "zwp_linux_dmabuf_v1" => {
@@ -395,10 +470,65 @@ pub fn capture_output(name: &str, with_cursor: bool) -> Result<Capture, String> 
         }
         let _ = tx.send(result);
     });
-    match rx.recv_timeout(std::time::Duration::from_secs(8)) {
+    match rx.recv_timeout(CAPTURE_TIMEOUT) {
         Ok(r) => r,
-        Err(_) => Err("抓屏超时：合成器 5 秒内没有返回画面".into()),
+        Err(_) => Err(format!(
+            "抓屏超时：合成器 {} 秒内没有返回画面",
+            CAPTURE_TIMEOUT.as_secs()
+        )),
     }
+}
+
+/// 等下一批事件并派发，最多等 `budget`；返回 false 表示这段时间一个事件都没来
+fn wait_events(
+    state: &mut State,
+    queue: &mut EventQueue<State>,
+    budget: Duration,
+) -> Result<bool, String> {
+    // 先把已经收下来的事件派发掉
+    if queue
+        .dispatch_pending(state)
+        .map_err(|e| format!("处理抓屏事件失败: {e}"))?
+        > 0
+    {
+        return Ok(true);
+    }
+    queue
+        .flush()
+        .map_err(|e| format!("发送抓屏请求失败: {e}"))?;
+    let Some(guard) = queue.prepare_read() else {
+        // 后端内部还有待派发的队列，下一轮接着来
+        return Ok(true);
+    };
+    let fd = guard.connection_fd().as_raw_fd();
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = budget.as_millis().min(i32::MAX as u128) as i32;
+    // SAFETY: pfd 是本地变量，poll 只读写这一项
+    let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(format!("等待抓屏时 poll 失败: {err}"));
+    }
+    if rc == 0 {
+        return Ok(false);
+    }
+    match guard.read() {
+        Ok(_) => {}
+        Err(wayland_client::backend::WaylandError::Io(e))
+            if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(e) => return Err(format!("读取抓屏事件失败: {e}")),
+    }
+    queue
+        .dispatch_pending(state)
+        .map_err(|e| format!("处理抓屏事件失败: {e}"))?;
+    Ok(true)
 }
 
 fn capture_blocking(name: &str, with_cursor: bool, allow_dmabuf: bool) -> Result<Capture, String> {
@@ -428,14 +558,25 @@ fn capture_blocking(name: &str, with_cursor: bool, allow_dmabuf: bool) -> Result
     state.use_dmabuf = allow_dmabuf
         && meta.transform == wl_output::Transform::Normal
         && state.dmabuf.is_some()
+        // 没有 buffer_done 事件的版本不知道该在哪一步发 copy，直接走共享内存
+        && state.manager_version >= frame::EVT_BUFFER_DONE_SINCE
         && std::env::var_os("FOCUSSNAPS_NO_DMABUF").is_none();
     let qh = queue.handle();
-    let _frame = manager.capture_output(if with_cursor { 1 } else { 0 }, &output, &qh, ());
+    let frame = manager.capture_output(if with_cursor { 1 } else { 0 }, &output, &qh, ());
+    state.frame = Some(frame);
 
+    let deadline = Instant::now() + ATTEMPT_TIMEOUT;
     while !state.finished {
-        queue
-            .blocking_dispatch(&mut state)
-            .map_err(|e| format!("等待抓屏失败: {e}"))?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            state.failed = Some(format!(
+                "等待合成器返回画面超时（{} 秒）",
+                ATTEMPT_TIMEOUT.as_secs()
+            ));
+            state.finished = true;
+            break;
+        }
+        wait_events(&mut state, &mut queue, left)?;
     }
     if let Some(err) = state.failed.take() {
         return Err(err);
